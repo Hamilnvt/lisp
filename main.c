@@ -10,75 +10,174 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
-#define DEBUG
+#define DEBUG_ENABLED true
+bool in_repl = false;
 
-typedef struct LispObject LispObject;
-
-typedef struct {
-    LispObject **items;
-    size_t count;
-    size_t capacity;
-} LispObjects;
+#define DEBUG (DEBUG_ENABLED && !in_repl)
+#define DEBUG_PRINT(fmt, ...) \
+    do { if (DEBUG) { printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); } } while (0)
 
 typedef enum {
-    TYPE_FUNCTION,
+    TYPE_NIL,
+    TYPE_SYMBOL,
     TYPE_INTEGER,
     TYPE_BOOLEAN,
     TYPE_STRING,
     __types_count
-} LispType ;
+} Type ;
 
-struct LispObject {
+typedef union {
+    int integer;
+    bool boolean;
+    char *string;
+    char *symbol;
+} Value;
+
+typedef struct {
+    Type type;
+    Value value;
+} Atom;
+
+typedef struct Expression {
     bool is_list;
     union {
+        Atom atom;
         struct {
-            LispType type;
-            union {
-                int integer;
-                bool boolean;
-                char *string;
-                char *function;
-            } value;
-        } atom;
-        LispObjects list;
+            struct Expression *this;
+            struct Expression *next;
+        } list;
     };
-};
+} Expression;
 
-LispObject *create_object(void)
+typedef struct {
+    Expression *expr; 
+    bool error;
+    char message[4096];
+} Result;
+
+static inline Result make_result(Expression *e) { return (Result){.expr=e}; }
+
+static inline Result make_error(char *fmt, ...)
 {
-    LispObject *o = calloc(1, sizeof(LispObject));
-    return o;
+    va_list args;
+    va_start(args, fmt);
+
+    Result err = {.error=true};
+    vsnprintf(err.message, sizeof(err.message), fmt, args);
+
+    va_end(args);
+    return err;
 }
 
-LispObject *create_atom(LispType type)
+static inline Value *value(Expression *e)
 {
-    LispObject *o = create_object();
-    o->atom.type = type;
-    return o;
+    assert(e);
+    assert(!e->is_list);
+    return &e->atom.value;
 }
 
-LispObject *create_list()
+static inline Type type(Expression *e)
 {
-    LispObject *o = calloc(1, sizeof(LispObject));
-    o->is_list = true;
-    return o;
+    assert(e);
+    assert(!e->is_list);
+    return e->atom.type;
 }
 
-void add_to_list(LispObject *list, LispObject *item)
+static inline Expression *this(Expression *e)
+{
+    assert(e);
+    assert(e->is_list);
+    return e->list.this;
+}
+
+static inline Expression *next(Expression *e)
+{
+    assert(e);
+    assert(e->is_list);
+    return e->list.next;
+}
+
+static inline size_t list_len(Expression *list)
+{
+    if (!list) return 0;
+    assert(list->is_list);
+    size_t len = 0;
+    while (list) {
+        len++;
+        list = next(list);
+    }
+    return len;
+}
+
+static inline bool list_is_empty(Expression *list) { return list_len(list) == 0; }
+
+static inline Expression *list_at(Expression *list, int at)
+{
+    size_t len = list_len(list);
+    assert(at >= -(int)len && at < (int)len && "List access out of bounds");
+
+    Expression *result = NULL;
+    Expression *it = NULL;
+    if (at >= 0) {
+        size_t i = 0;
+        it = list;
+        while (i < (size_t)at) {
+            it = next(it);
+            i++;
+        }
+        result = this(it);
+    } else {
+        printf("TODO: list negative index not yet implemented\n");
+        exit(1);
+    }
+    return result;
+}
+
+#define for_list(list) \
+    for (Expression *it = (list); it; it = next(it))
+
+Expression *create_expression(void)
+{
+    Expression *e = calloc(1, sizeof(Expression));
+    return e;
+}
+
+Expression *create_atom(Type type)
+{
+    Expression *e = create_expression();
+    e->atom.type = type;
+    return e;
+}
+
+static inline Expression *create_nil() { return create_atom(TYPE_NIL); }
+
+Expression *create_list()
+{
+    Expression *e = calloc(1, sizeof(Expression));
+    e->is_list = true;
+    return e;
+}
+
+void add_to_list(Expression *list, Expression *item)
 {
     assert(list);    
     assert(list->is_list);
     assert(item);
 
-    da_push(&list->list, item);
+    if (this(list)) { // Not the first element
+        while (next(list)) list = next(list);
+        Expression *new = create_list();
+        new->list.this = item;
+        list->list.next = new;
+    } else { // First element of list
+        list->list.this = item;
+    }
 }
 
-LispObject *create_nil() { return create_list(); }
-
-LispObject *parse_atom(char *atom_str, size_t *_pos)
+Result parse_atom(char *atom_str, size_t *_pos)
 {
     size_t pos = *_pos;
-    LispObject *atom = create_object();
+    Expression *atom = create_expression();
     Nob_String_Builder sb = {0};
 
     if (isdigit(atom_str[pos])) { // TYPE_INTEGER
@@ -87,12 +186,11 @@ LispObject *parse_atom(char *atom_str, size_t *_pos)
             pos++;
         }
         if (!isspace(atom_str[pos]) && atom_str[pos] != '(' && atom_str[pos] != ')') {
-            printf("ERROR: number has trailing characters starting with '%c'\n", atom_str[pos]);
-            exit(1);
+            return make_error("Number has trailing characters starting with '%c'\n", atom_str[pos]);
         }
         sb_append_null(&sb);
         atom->atom.type = TYPE_INTEGER;
-        atom->atom.value.integer = atoi(sb.items);
+        value(atom)->integer = atoi(sb.items);
     } else if (atom_str[pos] == '"') { // TYPE_STRING
         pos++;
         while (atom_str[pos] != '"') {
@@ -101,9 +199,9 @@ LispObject *parse_atom(char *atom_str, size_t *_pos)
         }
         pos++;
         atom->atom.type = TYPE_STRING;
-        atom->atom.value.string = sb.items;
-    } else { // TYPE_FUNCTION, TYPE_BOOLEAN
-        while (!isblank(atom_str[pos]) && atom_str[pos] != '(' && atom_str[pos] != ')') {
+        value(atom)->string = sb.items;
+    } else { // TYPE_SYMBOL, TYPE_BOOLEAN
+        while (!isspace(atom_str[pos]) && atom_str[pos] != '(' && atom_str[pos] != ')') {
             sb_append(&sb, atom_str[pos]);
             pos++;
         }
@@ -111,43 +209,43 @@ LispObject *parse_atom(char *atom_str, size_t *_pos)
 
         if (strcmp(sb.items, "true") == 0) {
             atom->atom.type = TYPE_BOOLEAN;
-            atom->atom.value.boolean = true;
+            value(atom)->boolean = true;
             sb_free(sb);
         } else if (strcmp(sb.items, "false") == 0) {
             atom->atom.type = TYPE_BOOLEAN;
-            atom->atom.value.boolean = false;
+            value(atom)->boolean = false;
             sb_free(sb);
         } else {
-            atom->atom.type = TYPE_FUNCTION;
-            atom->atom.value.function = sb.items;
+            atom->atom.type = TYPE_SYMBOL;
+            value(atom)->symbol = sb.items;
         }
     }
 
     *_pos = pos;
-    return atom;
+    return make_result(atom);
 }
 
-LispObject *parse_list(char *list_str, size_t *_pos);
+Result parse_list(char *list_str, size_t *_pos);
 
-LispObject *parse_object(char *obj_str, size_t *_pos)
+Result parse_expression(char *expr_str, size_t *_pos)
 {
     size_t pos = *_pos;
-    LispObject *object = NULL;
+    Result result = {0};
 
-    if (obj_str[pos] == '(') {
-        object = parse_list(obj_str, &pos);
+    if (expr_str[pos] == '(') {
+        result = parse_list(expr_str, &pos);
     } else {
-        object = parse_atom(obj_str, &pos);
+        result = parse_atom(expr_str, &pos);
     }
 
     *_pos = pos;
-    return object;
+    return result;
 }
 
-LispObject *parse_list(char *list_str, size_t *_pos)
+Result parse_list(char *list_str, size_t *_pos)
 {
     size_t pos = *_pos;
-    LispObject *list = create_list();
+    Expression *list = create_list();
 
     pos++;
     while (list_str[pos] != ')') {
@@ -158,18 +256,45 @@ LispObject *parse_list(char *list_str, size_t *_pos)
 
         if (list_str[pos] == ')') break;
 
-        LispObject *object = parse_object(list_str, &pos);
-        add_to_list(list, object);
+        Result r = parse_expression(list_str, &pos);
+        if (r.error) return r;
+        add_to_list(list, r.expr);
     }
     pos++;
 
     *_pos = pos;
-    return list;
+    return make_result(list);
 }
 
-LispObjects parse_program(char *program_str)
+void print_expression(Expression *e)
 {
-    LispObjects program = {0};
+    assert(e && "Printing NULL expression");
+    if (e->is_list) {
+        printf("(");
+        for_list(e) {
+            print_expression(this(it));
+            if (next(it)) printf(" ");
+        }
+        printf(")");
+    } else {
+        switch (type(e)) {
+        case TYPE_NIL:     printf("nil");                                      break;
+        case TYPE_SYMBOL:  printf("%s", value(e)->symbol);                     break;
+        case TYPE_INTEGER: printf("%d", value(e)->integer);                    break;
+        case TYPE_BOOLEAN: printf("%s", value(e)->boolean ? "true" : "false"); break;
+        case TYPE_STRING:  printf("\"%s\"", value(e)->string);                 break;
+
+        case __types_count:
+        default:
+            printf("Unreachable atom type %d in print_expression\n", type(e));
+            abort();
+        }
+    }
+}
+
+Result parse_program(char *program_str)
+{
+    Expression *program = create_list();
     size_t pos = 0;
 
     while (program_str[pos] != '\0') {
@@ -181,110 +306,128 @@ LispObjects parse_program(char *program_str)
         if (program_str[pos] == '\0') break;
 
         if (program_str[pos] != '(') {
-            printf("ERROR: Top level expression is not a list, it starts with '%c'\n", program_str[pos]);
-            exit(1);
+            return make_error("ERROR: Top level expression is not a list, it starts with '%c'\n", program_str[pos]);
         }
 
-        LispObject *list = parse_list(program_str, &pos);
-        da_push(&program, list);
+        Result r = parse_list(program_str, &pos);
+        if (r.error) return r;
+        add_to_list(program, r.expr);
     }
 
-    return program;
+    return make_result(program);
 }
 
-void print_object(const LispObject *o)
-{
-    assert(o && "Printing NULL object");
-    if (o->is_list) {
-        printf("(");
-        for (size_t i = 0; i < o->list.count; i++) {
-            print_object(o->list.items[i]);
-            if (i < o->list.count-1) printf(" ");
-        }
-        printf(")");
-    } else {
-        switch (o->atom.type) {
-        case TYPE_FUNCTION: printf("%s", o->atom.value.function); break;
-        case TYPE_INTEGER: printf("%d", o->atom.value.integer); break;
-        case TYPE_BOOLEAN: printf("%s", o->atom.value.boolean ? "true" : "false"); break;
-        case TYPE_STRING: printf("\"%s\"", o->atom.value.string); break;
-
-        case __types_count:
-        default:
-            printf("Unreachable atom type %d\n", o->atom.type);
-            exit(1);
-        }
-    }
-}
-
-typedef LispObject *(*LispFn)(LispObject *args);
+typedef Result (*Fn)(Expression *args);
 
 typedef struct
 {
     const char *name;
-    LispFn fn;
-} LispFunction;
+    Fn fn;
+} Function;
 
-#define LispBuiltinFunction(function_name) \
-    LispObject *builtin_ ##function_name(LispObject *args) \
+#define BuiltinFunction(function_name) \
+    Result builtin_ ##function_name(Expression *args) \
     { \
-        assert(args && "NULL object passed to builtin function "#function_name); \
-        assert(args->is_list && "Object passed to builtin function "#function_name" is not a list"); \
-        const char *fn_name = args->list.items[0]->atom.value.function; (void)fn_name; \
+        assert(args && "NULL expression passed to builtin function "#function_name); \
+        assert(args->is_list && "Expression passed to builtin function "#function_name" is not a list"); \
+        const char *fn_name = value(this(args))->symbol; (void)fn_name; \
+        args = next(args); \
+        size_t args_count = list_len(args); (void)args_count; \
 
-LispBuiltinFunction(print)
-    for (size_t i = 1; i < args->list.count; i++) {
-        print_object(args->list.items[i]);
+BuiltinFunction(print)
+    for_list(args) {
+        print_expression(this(it));
         printf("\n");
     }
-    return create_nil();
+    return make_result(create_nil());
 }
 
-LispBuiltinFunction(math)
-    if (args->list.count-1 < 2) {
-        printf("ERROR: number of arguments mismatch, wanted at least 2 but got %zu\n", args->list.count-1);
+BuiltinFunction(math_plus_and_mult)
+    if (args_count < 2) {
+        printf("ERROR: number of arguments mismatch, wanted at least 2 but got %zu\n", args_count);
         exit(1);
     }
     int accumulator = 0;
-    for (size_t i = 1; i < args->list.count; i++) {
-        LispObject *arg = args->list.items[i];
-        if (arg->is_list || arg->atom.type != TYPE_INTEGER) {
-            printf("ERROR: arguments mismatch, wanted integer but got object: ");
-            print_object(arg);
+    for_list(args) {
+        Expression *arg = this(it);
+        if (arg->is_list || type(arg) != TYPE_INTEGER) {
+            printf("ERROR: arguments mismatch, wanted integer but got expression: ");
+            print_expression(arg);
             printf("\n");
             exit(1);
         }
-        if (accumulator == 0) accumulator = arg->atom.value.integer;
+        if (accumulator == 0) accumulator = value(arg)->integer;
         else {
             if (strcmp(fn_name, "+") == 0) {
-                accumulator += arg->atom.value.integer;
-            } else if (strcmp(fn_name, "-") == 0) {
-                accumulator -= arg->atom.value.integer;
+                accumulator += value(arg)->integer;
             } else if (strcmp(fn_name, "*") == 0) {
-                accumulator *= arg->atom.value.integer;
-            } else if (strcmp(fn_name, "/") == 0) {
-                accumulator /= arg->atom.value.integer;
+                accumulator *= value(arg)->integer;
             } else {
-                printf("TODO: math function `%s`\n", fn_name);
+                printf("ERROR: unknown math function `%s`\n", fn_name);
                 exit(1);
             }
         }
     }
-    LispObject *result = create_atom(TYPE_INTEGER);
-    result->atom.value.integer = accumulator;
-    return result;
+    Expression *result = create_atom(TYPE_INTEGER);
+    value(result)->integer = accumulator;
+    return make_result(result);
 }
 
-LispFunction builtin_functions[] = {
+Result eval(Expression *e);
+
+bool to_boolean(Expression *e)
+{
+    assert(e);
+    if (e->is_list) {
+        return list_len(e) > 0;
+    } else {
+        switch (type(e)) {
+        case TYPE_NIL:      return false;
+        case TYPE_SYMBOL:   return true;
+        case TYPE_INTEGER:  return value(e)->integer > 0;
+        case TYPE_BOOLEAN:  return value(e)->boolean;
+        case TYPE_STRING:   return strlen(value(e)->string) > 0;
+
+        case __types_count:
+        default:
+            printf("Unreachable atom type %d in to_boolean\n", type(e));
+            exit(1);
+        }
+    }
+}
+
+BuiltinFunction(if)
+    if (args_count != 3) {
+        printf("ERROR: number of arguments mismatch, wanted 3 but got %zu\n", args_count);
+        exit(1);
+    }
+    Expression *condition = list_at(args, 0);
+    Result eval_result = eval(condition);
+    if (eval_result.error) return eval_result;
+    Expression *evaluated_condition = eval_result.expr;
+
+    if (DEBUG) {
+        printf("[DEBUG] Condition `");
+        print_expression(condition);
+        printf("` has been evaluated to ");
+        print_expression(evaluated_condition);
+        printf("\n");
+    }
+
+    Expression *tt = list_at(args, 1);
+    Expression *ff = list_at(args, 2);
+    return eval(to_boolean(evaluated_condition) ? tt : ff);
+}
+
+Function builtin_functions[] = {
     {.name="print", .fn=builtin_print},
-    {.name="+",     .fn=builtin_math},
-    {.name="-",     .fn=builtin_math},
-    {.name="*",     .fn=builtin_math},
-    {.name="/",     .fn=builtin_math},
+    {.name="+",     .fn=builtin_math_plus_and_mult},
+    {.name="if",     .fn=builtin_if},
+    {.name="*",     .fn=builtin_math_plus_and_mult},
 };
 const size_t builtin_functions_count = sizeof(builtin_functions)/sizeof(builtin_functions[0]);
 
-LispFn get_function_by_name(const char *name)
+Fn get_function_by_name(const char *name)
 {
     for (size_t i = 0; i < builtin_functions_count; i++) {
         if (strcmp(builtin_functions[i].name, name) == 0) return builtin_functions[i].fn;
@@ -292,86 +435,43 @@ LispFn get_function_by_name(const char *name)
     return NULL;
 }
 
-LispObject *eval(LispObject *o)
+Result eval(Expression *e)
 {
-    assert(o);
+    assert(e);
 
-#ifdef DEBUG
-    printf("Evaluating object ");
-    print_object(o);
-    printf("\n");
-#endif
+    if (DEBUG) {
+        printf("[DEBUG] Evaluating expression ");
+        print_expression(e);
+        printf("\n");
+    }
 
-    LispObject *result = NULL;
+    Result result = {0};
 
-    if (o->is_list) {
-        if (o->list.count == 0) {
-            result = o;
+    if (e->is_list) {
+        if (list_is_empty(e)) {
+            result.expr = e;
         } else {
-            LispObject *ofn = o->list.items[0];
-            if (ofn->is_list || ofn->atom.type != TYPE_FUNCTION) {
-                printf("\nERROR: Cannot evaluate non function object\n");
-                printf("NOTE: Offending object: ");
-                print_object(ofn);
+            Expression *efn = this(e);
+            if (efn->is_list || type(efn) != TYPE_SYMBOL) {
+                printf("\nERROR: Cannot evaluate non function expression\n");
+                printf("NOTE: Offending expression: ");
+                print_expression(efn);
                 printf("\n");
                 exit(1);
             }
-            LispFn fn = get_function_by_name(ofn->atom.value.function);
+            Fn fn = get_function_by_name(value(efn)->symbol);
             if (!fn) {
-                printf("\nERROR: Unknown function `%s`\n", ofn->atom.value.function);
+                printf("\nERROR: Unknown function `%s`\n", value(efn)->symbol);
                 exit(1);
             }
-
-            for (size_t i = 1; i < o->list.count; i++) {
-                if (!o->list.items[i]->is_list) continue;
-                LispObject *evaluated = eval(o->list.items[i]);
-                if (evaluated != o->list.items[i]) {
-                    free(o->list.items[i]);
-                    o->list.items[i] = evaluated;
-                }
-            }
-
-            printf("Executing function `%s`\n", ofn->atom.value.function);
-            result = fn(o);
+            DEBUG_PRINT("Executing function `%s`", value(efn)->symbol);
+            result = fn(e);
         }
     } else {
-        result = o;
+        result.expr = e;
     }
      
     return result;
-}
-
-void test(void)
-{
-    LispObject *L = create_list();
-
-    //LispObject *af = create_atom(TYPE_FUNCTION);
-    //af->atom.value.function = strdup("palle");
-    //add_to_list(L, af);
-
-    LispObject *ai = create_atom(TYPE_INTEGER);
-    ai->atom.value.integer = 69;
-    add_to_list(L, ai);
-
-    LispObject *ab = create_atom(TYPE_BOOLEAN);
-    ab->atom.value.boolean = true;
-    add_to_list(L, ab);
-
-    LispObject *as = create_atom(TYPE_STRING);
-    as->atom.value.string = strdup("Ciao caro");
-    add_to_list(L, as);
-
-    printf("List = ");
-    print_object(L);
-    printf("\n");
-
-    printf("Evaluation: =======================\n");
-    LispObject *result = eval(L);
-    printf("===================================\n");
-
-    printf("Evaluated List = ");
-    print_object(result);
-    printf("\n");
 }
 
 void addToHistory(char *input) { printf("- Adding input to history: %s\n", input); }
@@ -384,7 +484,9 @@ void usage()
 int main(int argc, char **argv)
 {
     if (argc == 1) { // REPL MODE
-        printf("\nLisp Version 0.0.1\n\n");
+        in_repl = true;
+
+        printf("\nLisp (version 0.0.1)\n\n");
         char buffer[1024];
         char *input = NULL;
         while (true) {
@@ -398,9 +500,27 @@ int main(int argc, char **argv)
             input[strlen(input)-1] = '\0';
             if (strlen(input) == 0) continue;
 
-            if (strcmp(input, "quit") == 0 || strcmp(input, "q") == 0) break;
-
-            printf("You wrote: \"%s\"\n\n", input);
+            if (input[0] == '!') {
+                input++;
+                if (strcmp(input, "quit") == 0 || strcmp(input, "q") == 0) break;
+                else {
+                    printf("ERROR: Unknown command `%s`\n", input);
+                }
+            } else {
+                size_t pos = 0;
+                Result parse_result = parse_expression(input, &pos);
+                if (parse_result.error) {
+                    printf("Parse error: %s\n", parse_result.message);
+                    continue;
+                }
+                Result eval_result = eval(parse_result.expr);
+                if (eval_result.error) {
+                    printf("Evaluation error: %s\n", eval_result.message);
+                    continue;
+                }
+                print_expression(eval_result.expr);
+                printf("\n");
+            }
         }
     } else if (argc == 2) { // INTERPRETER MODE
         const char *filepath = argv[1];
@@ -412,13 +532,25 @@ int main(int argc, char **argv)
         sb_append_null(&sb);
         char *program_str = sb.items;
 
-        LispObjects program = parse_program(program_str);
+        Result parse_result = parse_program(program_str);
+        if (parse_result.error) {
+            printf("Parse error: %s\n", parse_result.message);
+            return 1;
+        }
+        Expression *program = parse_result.expr;
+        size_t expressions_count = list_len(program);
 
-        printf("Program has been parsed into %zu expression%s\n", program.count, program.count == 1 ? "" : "s");
+        DEBUG_PRINT("Program has been parsed into %zu expression%s\n", expressions_count,
+                expressions_count == 1 ? "" : "s");
 
         printf("Evaluating program:\n\n");
-        for (size_t i = 0; i < program.count; i++)
-            eval(program.items[i]);
+        for_list(program) {
+            Result eval_result = eval(this(it));
+            if (eval_result.error) {
+                printf("Evaluation error: %s\n", eval_result.message);
+                return 1;
+            }
+        }
 
     } else {
         usage();

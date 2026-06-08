@@ -1,1 +1,7 @@
-(print (/ 1 2 3))
+(if true
+  (if false 
+    (print "daje")
+    (print "pronti"))
+  (print 34))
+
+(print ())
