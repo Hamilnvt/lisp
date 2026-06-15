@@ -1,3 +1,5 @@
+// TODO: create some examples
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -341,7 +343,9 @@ typedef struct
 {
     const char *name;
     Fn fn;
-} Function;
+} BuiltinFunction;
+
+typedef BuiltinFunction SpecialForm;
 
 #define SpecialForm(form_name) \
     Result special_form_ ##form_name(Expression *args) \
@@ -402,19 +406,34 @@ SpecialForm(if)
     return eval(to_boolean(evaluated_condition) ? tt : ff);
 }
 
-struct
-{
-    Function *items;
-    size_t count;
-    size_t capacity;
-} user_functions = {0};
-
 typedef struct
 {
     char **items;
     size_t count;
     size_t capacity;
 } CStrings;
+
+typedef struct
+{
+    const char *name;
+    CStrings params;
+    Expression *body;
+} UserFunction;
+
+struct
+{
+    UserFunction *items;
+    size_t count;
+    size_t capacity;
+} user_functions = {0};
+
+UserFunction *get_user_function(const char *name)
+{
+    for (size_t i = 0; i < user_functions.count; i++) {
+        if (strcmp(user_functions.items[i].name, name) == 0) return &user_functions.items[i];
+    }
+    return NULL;
+}
 
 SpecialForm(defun)
     if (args_count != 3) {
@@ -458,30 +477,32 @@ SpecialForm(defun)
         printf("\n");
     }
 
-    // TODO:
-    // - create a new type UserFunction that has fields: name, params and body
-    // - when executing user functions the formal params in the body are substituted with the evaluated actual params, then the expression is evaluated 
-    // - differentiate between builtin function call and user call
-    return make_error("TODO: %s not yet implemented", name);
+    UserFunction uf = {
+        .name = strdup(value(def_name)->symbol),
+        .params = params,
+        .body = def_body
+    };
+
+    da_push(&user_functions, uf);
 
     return make_result(create_nil());
 }
 
-Function special_forms[] = {
+SpecialForm special_forms[] = {
     {.name="if",    .fn=special_form_if},
     {.name="defun", .fn=special_form_defun},
 };
 const size_t special_forms_count = sizeof(special_forms)/sizeof(special_forms[0]);
 
-Fn get_special_form_by_name(const char *name)
+SpecialForm *get_special_form(const char *name)
 {
     for (size_t i = 0; i < special_forms_count; i++) {
-        if (strcmp(special_forms[i].name, name) == 0) return special_forms[i].fn;
+        if (strcmp(special_forms[i].name, name) == 0) return &special_forms[i];
     }
     return NULL;
 }
 
-#define BuiltinFunction(function_name) \
+#define DefineBuiltinFunction(function_name) \
     Result builtin_ ##function_name(Expression *args) \
     { \
         assert(args && "NULL expression passed to builtin function "#function_name); \
@@ -490,7 +511,7 @@ Fn get_special_form_by_name(const char *name)
         args = next(args); \
         size_t args_count = list_len(args); (void)args_count; \
 
-BuiltinFunction(print)
+DefineBuiltinFunction(print)
     for_list(args) {
         print_expression(this(it));
         printf("\n");
@@ -498,7 +519,7 @@ BuiltinFunction(print)
     return make_result(create_nil());
 }
 
-BuiltinFunction(math_plus_and_mult)
+DefineBuiltinFunction(math_plus_and_mult)
     if (args_count < 2) {
         return make_error("Number of arguments mismatch, wanted at least 2 but got %zu", args_count);
     }
@@ -528,22 +549,49 @@ BuiltinFunction(math_plus_and_mult)
     return make_result(result);
 }
 
-Function builtin_functions[] = {
+BuiltinFunction builtin_functions[] = {
     {.name="print", .fn=builtin_print},
     {.name="+",     .fn=builtin_math_plus_and_mult},
     {.name="*",     .fn=builtin_math_plus_and_mult},
 };
 const size_t builtin_functions_count = sizeof(builtin_functions)/sizeof(builtin_functions[0]);
 
-Fn get_function_by_name(const char *name)
+BuiltinFunction *get_builtin_function(const char *name)
 {
     for (size_t i = 0; i < builtin_functions_count; i++) {
-        if (strcmp(builtin_functions[i].name, name) == 0) return builtin_functions[i].fn;
-    }
-    for (size_t i = 0; i < user_functions.count; i++) {
-        if (strcmp(user_functions.items[i].name, name) == 0) return user_functions.items[i].fn;
+        if (strcmp(builtin_functions[i].name, name) == 0) return &builtin_functions[i];
     }
     return NULL;
+}
+
+static inline Result evaluate_special_form(SpecialForm *sf, Expression *arg)
+{
+    DEBUG_PRINT("Executing special form `%s`", sf->name);
+    return sf->fn(arg);
+}
+
+Result evaluate_builtin_function(BuiltinFunction *bf, Expression *arg)
+{
+    for_list(arg) {
+        if (it == arg) continue;
+        Result eval_arg = eval(this(it));
+        if (eval_arg.error) return eval_arg;
+        set_this(it, eval_arg.expr);
+    }
+
+    DEBUG_PRINT("Executing builtin function `%s`", bf->name);
+    return bf->fn(arg);
+}
+
+// TODO:
+// - create a new type UserFunction that has fields: name, params and body
+// - when executing user functions the formal params in the body are substituted with the evaluated actual params, then the expression is evaluated 
+// - differentiate between builtin function call and user call
+Result evaluate_user_function(UserFunction *uf, Expression *arg)
+{
+    (void)uf;
+    (void)arg;
+    return make_error("TODO: evaluate_user_function not yet implemented");   
 }
 
 Result eval(Expression *e)
@@ -571,24 +619,21 @@ Result eval(Expression *e)
                 printf("\nTODO: return Result rather than exiting the program\n");
                 exit(1);
             }
-            Fn fn = get_special_form_by_name(value(efn)->symbol);
-            if (fn) {
-                result = fn(e);
+            const char *function_name = value(efn)->symbol;
+            SpecialForm *sf = get_special_form(function_name);
+            if (sf) {
+                result = evaluate_special_form(sf, e);
             } else {
-                fn = get_function_by_name(value(efn)->symbol);
-                if (!fn) {
-                    return make_error("Unknown function `%s`", value(efn)->symbol);
+                BuiltinFunction *bf = get_builtin_function(function_name);
+                if (bf) {
+                    result = evaluate_builtin_function(bf, e);
+                } else {
+                    UserFunction *uf = get_user_function(function_name);
+                    if (!uf) {
+                        return make_error("Unknown function `%s`", function_name);
+                    }
+                    result = evaluate_user_function(uf, e);
                 }
-
-                for_list(e) {
-                    if (it == e) continue;
-                    Result eval_arg = eval(this(it));
-                    if (eval_arg.error) return eval_arg;
-                    set_this(it, eval_arg.expr);
-                }
-
-                DEBUG_PRINT("Executing function `%s`", value(efn)->symbol);
-                result = fn(e);
             }
         }
     } else {
@@ -642,7 +687,7 @@ int main(int argc, char **argv)
                 }
                 Expression *parsed_expr = parse_result.expr;
                 if (!parsed_expr->is_list && type(parsed_expr) == TYPE_SYMBOL) {
-                    if (!get_function_by_name(value(parsed_expr)->symbol)) {
+                    if (!get_builtin_function(value(parsed_expr)->symbol)) {
                         printf("Error: Unknown symbol `%s`\n", value(parsed_expr)->symbol);
                         continue;
                     }
