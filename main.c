@@ -116,7 +116,7 @@ static inline size_t list_len(Expression *list)
     if (!list) return 0;
     assert(list->is_list);
     size_t len = 0;
-    while (list) {
+    while (list && this(list)) {
         len++;
         list = next(list);
     }
@@ -148,7 +148,7 @@ static inline Expression *list_at(Expression *list, int at)
 }
 
 #define for_list(list) \
-    for (Expression *it = (list); it; it = next(it))
+    for (Expression *it = (list); it && this(it); it = next(it))
 
 Expression *create_expression(void)
 {
@@ -223,7 +223,10 @@ Result parse_atom(char *atom_str, size_t *_pos)
         }
         sb_append_null(&sb);
 
-        if (strcmp(sb.items, "true") == 0) {
+        if (strcmp(sb.items, "nil") == 0) {
+            atom->atom.type = TYPE_NIL;
+            sb_free(sb);
+        } else if (strcmp(sb.items, "true") == 0) {
             atom->atom.type = TYPE_BOOLEAN;
             value(atom)->boolean = true;
             sb_free(sb);
@@ -378,12 +381,7 @@ bool to_boolean(Expression *e)
 }
 
 Result eval(Expression *e);
-// TODO: if is a special form, since the evaluation of the lists in the branches depends on the value (true/false) of the condition (short circuit)
-// creating a different set of functions (from the builtin functions) can let me:
-// 1. check if the function is a special form or a builtin function
-// 2. if special form: execute the special form
-// 3. if builtin function: evaluate internal expression and then execute the function
-// This lets me avoid rewriting the evaluation loop in every builtin function
+
 SpecialForm(if)
     if (args_count != 3) {
         return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
@@ -564,34 +562,103 @@ BuiltinFunction *get_builtin_function(const char *name)
     return NULL;
 }
 
-static inline Result evaluate_special_form(SpecialForm *sf, Expression *arg)
+static inline Result evaluate_special_form(SpecialForm *sf, Expression *args)
 {
     DEBUG_PRINT("Executing special form `%s`", sf->name);
-    return sf->fn(arg);
+    return sf->fn(args);
 }
 
-Result evaluate_builtin_function(BuiltinFunction *bf, Expression *arg)
+Result evaluate_builtin_function(BuiltinFunction *bf, Expression *args)
 {
-    for_list(arg) {
-        if (it == arg) continue;
+    for_list(args) {
+        if (it == args) continue;
         Result eval_arg = eval(this(it));
         if (eval_arg.error) return eval_arg;
         set_this(it, eval_arg.expr);
     }
 
     DEBUG_PRINT("Executing builtin function `%s`", bf->name);
-    return bf->fn(arg);
+    return bf->fn(args);
 }
 
-// TODO:
-// - create a new type UserFunction that has fields: name, params and body
-// - when executing user functions the formal params in the body are substituted with the evaluated actual params, then the expression is evaluated 
-// - differentiate between builtin function call and user call
-Result evaluate_user_function(UserFunction *uf, Expression *arg)
+Expression *clone_expression(Expression *e)
 {
-    (void)uf;
-    (void)arg;
-    return make_error("TODO: evaluate_user_function not yet implemented");   
+    Expression *c = create_expression();
+    if (e->is_list) {
+        c->is_list = true;
+        for_list(e) {
+            add_to_list(c, clone_expression(this(it)));
+        } 
+    } else {
+        Value *v = value(e);
+        c->atom.type = type(e);
+        switch (type(e)) {
+        case TYPE_NIL:                                             break;
+        case TYPE_SYMBOL:  value(c)->symbol  = strdup(v->symbol);  break;
+        case TYPE_INTEGER: value(c)->integer = v->integer;         break;
+        case TYPE_BOOLEAN: value(c)->boolean = v->boolean;         break;
+        case TYPE_STRING:  value(c)->string  = strdup(v->string);  break;
+        case __types_count:
+        default:
+            printf("Unreachable type %d in clone_expression\n", type(e));
+            abort();
+        }
+    }
+    return c;
+}
+
+void free_expression(Expression *e)
+{
+    if (e->is_list) {
+        for_list(e) {
+            free_expression(this(it));
+        }
+    } else {
+        Value *v = value(e);
+        switch (type(e)) {
+        case TYPE_NIL:
+        case TYPE_INTEGER:
+        case TYPE_BOOLEAN:
+            break;
+        case TYPE_SYMBOL:  free(v->symbol);  break;
+        case TYPE_STRING:  free(v->string);  break;
+        case __types_count:
+        default:
+            printf("Unreachable type %d in clone\n", type(e));
+            abort();
+        }
+    }
+    free(e);
+}
+
+void replace_args_in_body(Expression **body, CStrings params, Expression *args)
+{
+    if ((*body)->is_list) {
+        for_list(*body) {
+            replace_args_in_body(&it->list.this, params, args);
+        }
+    } else if (type(*body) == TYPE_SYMBOL) {
+        for (size_t i = 0; i < params.count; i++) {
+            if (strcmp(value(*body)->symbol, params.items[i]) == 0) {
+                free_expression(*body);
+                *body = list_at(args, i);
+                return;
+            }
+        }
+    }
+}
+
+Result evaluate_user_function(UserFunction *uf, Expression *args)
+{
+    args = next(args);
+    for_list(args) {
+        Result eval_arg = eval(this(it));
+        if (eval_arg.error) return eval_arg;
+        set_this(it, eval_arg.expr);
+    }
+    Expression *body = clone_expression(uf->body);
+    replace_args_in_body(&body, uf->params, args);
+    return eval(body);
 }
 
 Result eval(Expression *e)
@@ -687,6 +754,7 @@ int main(int argc, char **argv)
                 }
                 Expression *parsed_expr = parse_result.expr;
                 if (!parsed_expr->is_list && type(parsed_expr) == TYPE_SYMBOL) {
+                    // TODO: it can also be special form and user function
                     if (!get_builtin_function(value(parsed_expr)->symbol)) {
                         printf("Error: Unknown symbol `%s`\n", value(parsed_expr)->symbol);
                         continue;
