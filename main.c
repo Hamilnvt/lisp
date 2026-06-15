@@ -1,7 +1,3 @@
-/* TODO
-    - quando si vuole entrare in terminal mode si puo' specificare un file per caricare le variabili e le funzioni (ammesso che questo abbia senso)
-*/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +20,23 @@ typedef enum {
     TYPE_BOOLEAN,
     TYPE_STRING,
     __types_count
-} Type ;
+} Type;
+
+const char *type_to_string(Type type)
+{
+    switch (type) {
+    case TYPE_NIL:     return "Nil";
+    case TYPE_SYMBOL:  return "Symbol";
+    case TYPE_INTEGER: return "Integer";
+    case TYPE_BOOLEAN: return "Boolean";
+    case TYPE_STRING:  return "String";
+
+    case __types_count:
+    default:
+        printf("Unreachable type %d in type_to_string\n", type);
+        abort();
+    }
+}
 
 typedef union {
     int integer;
@@ -50,7 +62,7 @@ typedef struct Expression {
 } Expression;
 
 typedef struct {
-    Expression *expr; 
+    Expression *expr;
     bool error;
     char message[4096];
 } Result;
@@ -158,19 +170,21 @@ Expression *create_list()
     return e;
 }
 
+static inline void set_this(Expression *e, Expression *item) { e->list.this = item; }
+
 void add_to_list(Expression *list, Expression *item)
 {
-    assert(list);    
+    assert(list);
     assert(list->is_list);
     assert(item);
 
     if (this(list)) { // Not the first element
         while (next(list)) list = next(list);
         Expression *new = create_list();
-        new->list.this = item;
+        set_this(new, item);
         list->list.next = new;
     } else { // First element of list
-        list->list.this = item;
+        set_this(list, item);
     }
 }
 
@@ -186,7 +200,7 @@ Result parse_atom(char *atom_str, size_t *_pos)
             pos++;
         }
         if (!isspace(atom_str[pos]) && atom_str[pos] != '(' && atom_str[pos] != ')') {
-            return make_error("Number has trailing characters starting with '%c'\n", atom_str[pos]);
+            return make_error("Number has trailing characters starting with '%c'", atom_str[pos]);
         }
         sb_append_null(&sb);
         atom->atom.type = TYPE_INTEGER;
@@ -245,9 +259,13 @@ Result parse_expression(char *expr_str, size_t *_pos)
 Result parse_list(char *list_str, size_t *_pos)
 {
     size_t pos = *_pos;
+    if (list_str[pos] != '(') {
+        return make_error("Expecting '(' but got '%c'", list_str[pos]);
+    }
+    pos++;
+
     Expression *list = create_list();
 
-    pos++;
     while (list_str[pos] != ')') {
         while (isspace(list_str[pos])) {
             pos++;
@@ -306,7 +324,7 @@ Result parse_program(char *program_str)
         if (program_str[pos] == '\0') break;
 
         if (program_str[pos] != '(') {
-            return make_error("ERROR: Top level expression is not a list, it starts with '%c'\n", program_str[pos]);
+            return make_error("ERROR: Top level expression is not a list, it starts with '%c'", program_str[pos]);
         }
 
         Result r = parse_list(program_str, &pos);
@@ -324,6 +342,144 @@ typedef struct
     const char *name;
     Fn fn;
 } Function;
+
+#define SpecialForm(form_name) \
+    Result special_form_ ##form_name(Expression *args) \
+    { \
+        assert(args && "NULL expression passed to special form "#form_name); \
+        assert(args->is_list && "Expression passed to special form "#form_name" is not a list"); \
+        const char *name = value(this(args))->symbol; (void)name; \
+        args = next(args); \
+        size_t args_count = list_len(args); (void)args_count; \
+
+bool to_boolean(Expression *e)
+{
+    assert(e);
+    if (e->is_list) {
+        return list_len(e) > 0;
+    } else {
+        switch (type(e)) {
+        case TYPE_NIL:      return false;
+        case TYPE_SYMBOL:   return true;
+        case TYPE_INTEGER:  return value(e)->integer > 0;
+        case TYPE_BOOLEAN:  return value(e)->boolean;
+        case TYPE_STRING:   return strlen(value(e)->string) > 0;
+
+        case __types_count:
+        default:
+            printf("Unreachable atom type %d in to_boolean\n", type(e));
+            abort();
+        }
+    }
+}
+
+Result eval(Expression *e);
+// TODO: if is a special form, since the evaluation of the lists in the branches depends on the value (true/false) of the condition (short circuit)
+// creating a different set of functions (from the builtin functions) can let me:
+// 1. check if the function is a special form or a builtin function
+// 2. if special form: execute the special form
+// 3. if builtin function: evaluate internal expression and then execute the function
+// This lets me avoid rewriting the evaluation loop in every builtin function
+SpecialForm(if)
+    if (args_count != 3) {
+        return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
+    }
+    Expression *condition = list_at(args, 0);
+    Result eval_result = eval(condition);
+    if (eval_result.error) return eval_result;
+    Expression *evaluated_condition = eval_result.expr;
+
+    if (DEBUG) {
+        printf("[DEBUG] Condition `");
+        print_expression(condition);
+        printf("` has been evaluated to ");
+        print_expression(evaluated_condition);
+        printf("\n");
+    }
+
+    Expression *tt = list_at(args, 1);
+    Expression *ff = list_at(args, 2);
+    return eval(to_boolean(evaluated_condition) ? tt : ff);
+}
+
+struct
+{
+    Function *items;
+    size_t count;
+    size_t capacity;
+} user_functions = {0};
+
+typedef struct
+{
+    char **items;
+    size_t count;
+    size_t capacity;
+} CStrings;
+
+SpecialForm(defun)
+    if (args_count != 3) {
+        return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
+    }
+
+    Expression *def_name = list_at(args, 0); // TODO: it can be evaluated, could be powerful
+    if (def_name->is_list || type(def_name) != TYPE_SYMBOL) {
+        return make_error("Expecting name of function to be a symbol, but got %s",
+                def_name->is_list ? "List" : type_to_string(type(def_name)));
+    }
+
+    Expression *def_params_list = list_at(args, 1);
+    if (!def_params_list->is_list) {
+        return make_error("Expecting parameters list to be a list, but got %s", type_to_string(type(def_params_list)));
+    }
+    CStrings params = {0};
+    for_list(def_params_list) {
+        Expression *param = this(it);
+        if (param->is_list || type(param) != TYPE_SYMBOL) {
+            return make_error("Expecting parameter %zu to be a symbol, but got %s", params.count+1,
+                    param->is_list ? "List" : type_to_string(type(param)));
+        }
+        da_push(&params, strdup(value(param)->symbol));
+    }
+
+    Expression *def_body = list_at(args, 2);
+    if (!def_body->is_list) {
+        return make_error("Expecting body of function to be a list, but got %s", type_to_string(type(def_body)));
+    }
+
+    if (DEBUG) {
+        printf("[DEBUG] Defining function `");
+        print_expression(def_name);
+        printf("`:\n");
+        printf("[DEBUG] Parameters: ");
+        print_expression(def_params_list);
+        printf("\n");
+        printf("[DEBUG] Body: ");
+        print_expression(def_body);
+        printf("\n");
+    }
+
+    // TODO:
+    // - create a new type UserFunction that has fields: name, params and body
+    // - when executing user functions the formal params in the body are substituted with the evaluated actual params, then the expression is evaluated 
+    // - differentiate between builtin function call and user call
+    return make_error("TODO: %s not yet implemented", name);
+
+    return make_result(create_nil());
+}
+
+Function special_forms[] = {
+    {.name="if",    .fn=special_form_if},
+    {.name="defun", .fn=special_form_defun},
+};
+const size_t special_forms_count = sizeof(special_forms)/sizeof(special_forms[0]);
+
+Fn get_special_form_by_name(const char *name)
+{
+    for (size_t i = 0; i < special_forms_count; i++) {
+        if (strcmp(special_forms[i].name, name) == 0) return special_forms[i].fn;
+    }
+    return NULL;
+}
 
 #define BuiltinFunction(function_name) \
     Result builtin_ ##function_name(Expression *args) \
@@ -344,8 +500,7 @@ BuiltinFunction(print)
 
 BuiltinFunction(math_plus_and_mult)
     if (args_count < 2) {
-        printf("ERROR: number of arguments mismatch, wanted at least 2 but got %zu\n", args_count);
-        exit(1);
+        return make_error("Number of arguments mismatch, wanted at least 2 but got %zu", args_count);
     }
     int accumulator = 0;
     for_list(args) {
@@ -354,6 +509,7 @@ BuiltinFunction(math_plus_and_mult)
             printf("ERROR: arguments mismatch, wanted integer but got expression: ");
             print_expression(arg);
             printf("\n");
+            printf("\nTODO: return Result rather than exiting the program\n");
             exit(1);
         }
         if (accumulator == 0) accumulator = value(arg)->integer;
@@ -363,8 +519,7 @@ BuiltinFunction(math_plus_and_mult)
             } else if (strcmp(fn_name, "*") == 0) {
                 accumulator *= value(arg)->integer;
             } else {
-                printf("ERROR: unknown math function `%s`\n", fn_name);
-                exit(1);
+                return make_error("Unknown math function `%s`", fn_name);
             }
         }
     }
@@ -373,56 +528,9 @@ BuiltinFunction(math_plus_and_mult)
     return make_result(result);
 }
 
-Result eval(Expression *e);
-
-bool to_boolean(Expression *e)
-{
-    assert(e);
-    if (e->is_list) {
-        return list_len(e) > 0;
-    } else {
-        switch (type(e)) {
-        case TYPE_NIL:      return false;
-        case TYPE_SYMBOL:   return true;
-        case TYPE_INTEGER:  return value(e)->integer > 0;
-        case TYPE_BOOLEAN:  return value(e)->boolean;
-        case TYPE_STRING:   return strlen(value(e)->string) > 0;
-
-        case __types_count:
-        default:
-            printf("Unreachable atom type %d in to_boolean\n", type(e));
-            exit(1);
-        }
-    }
-}
-
-BuiltinFunction(if)
-    if (args_count != 3) {
-        printf("ERROR: number of arguments mismatch, wanted 3 but got %zu\n", args_count);
-        exit(1);
-    }
-    Expression *condition = list_at(args, 0);
-    Result eval_result = eval(condition);
-    if (eval_result.error) return eval_result;
-    Expression *evaluated_condition = eval_result.expr;
-
-    if (DEBUG) {
-        printf("[DEBUG] Condition `");
-        print_expression(condition);
-        printf("` has been evaluated to ");
-        print_expression(evaluated_condition);
-        printf("\n");
-    }
-
-    Expression *tt = list_at(args, 1);
-    Expression *ff = list_at(args, 2);
-    return eval(to_boolean(evaluated_condition) ? tt : ff);
-}
-
 Function builtin_functions[] = {
     {.name="print", .fn=builtin_print},
     {.name="+",     .fn=builtin_math_plus_and_mult},
-    {.name="if",     .fn=builtin_if},
     {.name="*",     .fn=builtin_math_plus_and_mult},
 };
 const size_t builtin_functions_count = sizeof(builtin_functions)/sizeof(builtin_functions[0]);
@@ -431,6 +539,9 @@ Fn get_function_by_name(const char *name)
 {
     for (size_t i = 0; i < builtin_functions_count; i++) {
         if (strcmp(builtin_functions[i].name, name) == 0) return builtin_functions[i].fn;
+    }
+    for (size_t i = 0; i < user_functions.count; i++) {
+        if (strcmp(user_functions.items[i].name, name) == 0) return user_functions.items[i].fn;
     }
     return NULL;
 }
@@ -457,20 +568,33 @@ Result eval(Expression *e)
                 printf("NOTE: Offending expression: ");
                 print_expression(efn);
                 printf("\n");
+                printf("\nTODO: return Result rather than exiting the program\n");
                 exit(1);
             }
-            Fn fn = get_function_by_name(value(efn)->symbol);
-            if (!fn) {
-                printf("\nERROR: Unknown function `%s`\n", value(efn)->symbol);
-                exit(1);
+            Fn fn = get_special_form_by_name(value(efn)->symbol);
+            if (fn) {
+                result = fn(e);
+            } else {
+                fn = get_function_by_name(value(efn)->symbol);
+                if (!fn) {
+                    return make_error("Unknown function `%s`", value(efn)->symbol);
+                }
+
+                for_list(e) {
+                    if (it == e) continue;
+                    Result eval_arg = eval(this(it));
+                    if (eval_arg.error) return eval_arg;
+                    set_this(it, eval_arg.expr);
+                }
+
+                DEBUG_PRINT("Executing function `%s`", value(efn)->symbol);
+                result = fn(e);
             }
-            DEBUG_PRINT("Executing function `%s`", value(efn)->symbol);
-            result = fn(e);
         }
     } else {
         result.expr = e;
     }
-     
+
     return result;
 }
 
@@ -486,14 +610,15 @@ int main(int argc, char **argv)
     if (argc == 1) { // REPL MODE
         in_repl = true;
 
-        printf("\nLisp (version 0.0.1)\n\n");
+        printf("\nLisp (version 0.0.1)\n");
         char buffer[1024];
         char *input = NULL;
         while (true) {
+            printf("\n");
             printf("> ");
             fflush(stdout);
 
-            memset(buffer, 0, sizeof(buffer));            
+            memset(buffer, 0, sizeof(buffer));
             input = fgets(buffer, sizeof(buffer), stdin);
 
             if (!input) continue;
@@ -503,7 +628,9 @@ int main(int argc, char **argv)
             if (input[0] == '!') {
                 input++;
                 if (strcmp(input, "quit") == 0 || strcmp(input, "q") == 0) break;
-                else {
+                else if (strcmp(input, "load") == 0 || strcmp(input, "l") == 0) {
+                    printf("TODO: load command is not yet implemented\n");
+                } else {
                     printf("ERROR: Unknown command `%s`\n", input);
                 }
             } else {
@@ -513,7 +640,15 @@ int main(int argc, char **argv)
                     printf("Parse error: %s\n", parse_result.message);
                     continue;
                 }
-                Result eval_result = eval(parse_result.expr);
+                Expression *parsed_expr = parse_result.expr;
+                if (!parsed_expr->is_list && type(parsed_expr) == TYPE_SYMBOL) {
+                    if (!get_function_by_name(value(parsed_expr)->symbol)) {
+                        printf("Error: Unknown symbol `%s`\n", value(parsed_expr)->symbol);
+                        continue;
+                    }
+                }
+
+                Result eval_result = eval(parsed_expr);
                 if (eval_result.error) {
                     printf("Evaluation error: %s\n", eval_result.message);
                     continue;
