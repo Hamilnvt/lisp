@@ -1,4 +1,9 @@
-// TODO: create some examples
+// TODO:
+// - create some examples
+// - add directives: commands that start with !
+//   > !debug enables debug prints
+// - quote '
+// - list
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,10 +13,10 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
-#define DEBUG_ENABLED true
+static bool debug_enabled = true;
 bool in_repl = false;
 
-#define DEBUG (DEBUG_ENABLED && !in_repl)
+#define DEBUG (debug_enabled && !in_repl)
 #define DEBUG_PRINT(fmt, ...) \
     do { if (DEBUG) { printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); } } while (0)
 
@@ -40,11 +45,39 @@ const char *type_to_string(Type type)
     }
 }
 
+typedef enum
+{
+    SYM_UNKNOWN = -1,
+    SYM_NULL = 0,
+    SYM_SPECIAL_FORM,
+    SYM_BUILTIN_FUNCTION,
+    SYM_USER_FUNCTION,
+    SYM_VARIABLE,
+    __symbol_kinds_cout
+} SymbolKind;
+
+typedef struct BuiltinFunction BuiltinFunction;
+typedef struct BuiltinFunction SpecialForm;
+typedef struct UserFunction UserFunction;
+typedef struct Variable Variable;
+
+typedef struct
+{
+    const char *name;
+    SymbolKind kind;
+    union {
+        SpecialForm *sf;
+        BuiltinFunction *bf;
+        UserFunction *uf;
+        Variable *var;
+    };
+} Symbol;
+
 typedef union {
     int integer;
     bool boolean;
     char *string;
-    char *symbol;
+    Symbol symbol;
 } Value;
 
 typedef struct {
@@ -54,6 +87,7 @@ typedef struct {
 
 typedef struct Expression {
     bool is_list;
+    bool is_quoted;
     union {
         Atom atom;
         struct {
@@ -236,7 +270,11 @@ Result parse_atom(char *atom_str, size_t *_pos)
             sb_free(sb);
         } else {
             atom->atom.type = TYPE_SYMBOL;
-            value(atom)->symbol = sb.items;
+            Symbol sym = {
+                .kind = SYM_NULL,
+                .name = sb.items
+            };
+            value(atom)->symbol = sym;
         }
     }
 
@@ -289,6 +327,7 @@ Result parse_list(char *list_str, size_t *_pos)
     return make_result(list);
 }
 
+void print_symbol(Symbol sym);
 void print_expression(Expression *e)
 {
     assert(e && "Printing NULL expression");
@@ -302,7 +341,7 @@ void print_expression(Expression *e)
     } else {
         switch (type(e)) {
         case TYPE_NIL:     printf("nil");                                      break;
-        case TYPE_SYMBOL:  printf("%s", value(e)->symbol);                     break;
+        case TYPE_SYMBOL:  printf(value(e)->symbol.name);                      break;
         case TYPE_INTEGER: printf("%d", value(e)->integer);                    break;
         case TYPE_BOOLEAN: printf("%s", value(e)->boolean ? "true" : "false"); break;
         case TYPE_STRING:  printf("\"%s\"", value(e)->string);                 break;
@@ -342,20 +381,17 @@ Result parse_program(char *program_str)
 
 typedef Result (*Fn)(Expression *args);
 
-typedef struct
-{
+struct BuiltinFunction {
     const char *name;
     Fn fn;
-} BuiltinFunction;
+};
 
-typedef BuiltinFunction SpecialForm;
-
-#define SpecialForm(form_name) \
+#define DefineSpecialForm(form_name) \
     Result special_form_ ##form_name(Expression *args) \
     { \
         assert(args && "NULL expression passed to special form "#form_name); \
         assert(args->is_list && "Expression passed to special form "#form_name" is not a list"); \
-        const char *name = value(this(args))->symbol; (void)name; \
+        const char *name = value(this(args))->symbol.name; (void)name; \
         args = next(args); \
         size_t args_count = list_len(args); (void)args_count; \
 
@@ -382,7 +418,7 @@ bool to_boolean(Expression *e)
 
 Result eval(Expression *e);
 
-SpecialForm(if)
+DefineSpecialForm(if)
     if (args_count != 3) {
         return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
     }
@@ -411,12 +447,11 @@ typedef struct
     size_t capacity;
 } CStrings;
 
-typedef struct
-{
+struct UserFunction {
     const char *name;
     CStrings params;
     Expression *body;
-} UserFunction;
+};
 
 struct
 {
@@ -433,7 +468,46 @@ UserFunction *get_user_function(const char *name)
     return NULL;
 }
 
-SpecialForm(defun)
+SpecialForm *get_special_form(const char *name);
+BuiltinFunction *get_builtin_function(const char *name);
+Variable *get_variable(const char *name);
+Symbol *get_symbol(const char *name)
+{
+    Symbol *found = calloc(1, sizeof(Symbol));
+    assert(found);
+
+    SpecialForm *sf = get_special_form(name);
+    if (sf) {
+        found->kind = SYM_SPECIAL_FORM;
+        found->sf = sf;
+        return found;
+    }
+
+    BuiltinFunction *bf = get_builtin_function(name);
+    if (bf) {
+        found->kind = SYM_BUILTIN_FUNCTION;
+        found->bf = bf;
+        return found;
+    }
+
+    UserFunction *uf = get_user_function(name);
+    if (uf) {
+        found->kind = SYM_USER_FUNCTION;
+        found->uf = uf;
+        return found;
+    }
+
+    Variable *var = get_variable(name);
+    if (var) {
+        found->kind = SYM_VARIABLE;
+        found->var = var;
+        return found;
+    }
+
+    return NULL;
+}
+
+DefineSpecialForm(defun)
     if (args_count != 3) {
         return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
     }
@@ -442,6 +516,12 @@ SpecialForm(defun)
     if (def_name->is_list || type(def_name) != TYPE_SYMBOL) {
         return make_error("Expecting name of function to be a symbol, but got %s",
                 def_name->is_list ? "List" : type_to_string(type(def_name)));
+    }
+    Symbol *redefined = get_symbol(value(def_name)->symbol.name);
+    if (redefined) {
+        // TODO: print kind as string
+        return make_error("Redefinition of symbol `%s`, first defined as a %d", value(def_name)->symbol.name,
+                redefined->kind);
     }
 
     Expression *def_params_list = list_at(args, 1);
@@ -455,7 +535,7 @@ SpecialForm(defun)
             return make_error("Expecting parameter %zu to be a symbol, but got %s", params.count+1,
                     param->is_list ? "List" : type_to_string(type(param)));
         }
-        da_push(&params, strdup(value(param)->symbol));
+        da_push(&params, strdup(value(param)->symbol.name));
     }
 
     Expression *def_body = list_at(args, 2);
@@ -476,7 +556,7 @@ SpecialForm(defun)
     }
 
     UserFunction uf = {
-        .name = strdup(value(def_name)->symbol),
+        .name = strdup(value(def_name)->symbol.name),
         .params = params,
         .body = def_body
     };
@@ -486,8 +566,73 @@ SpecialForm(defun)
     return make_result(create_nil());
 }
 
+struct Variable {
+    const char *name;
+    Expression *value;
+};
+
+Variable *create_var(const char *name, Expression *value)
+{
+    Variable *var = calloc(1, sizeof(Variable));
+    var->name = strdup(name);
+    var->value = value;
+    assert(var);
+    return var;
+}
+
+typedef struct
+{
+    Variable **items; 
+    size_t count;
+    size_t capacity;
+} Variables;
+static Variables variables = {0};
+
+DefineSpecialForm(let)
+    if (args_count != 2) {
+        return make_error("Number of arguments mismatch, wanted 2 but got %zu", args_count);
+    }
+
+    Expression *var_name = list_at(args, 0); // TODO: it can be evaluated, could be powerful
+    if (var_name->is_list || type(var_name) != TYPE_SYMBOL) {
+        return make_error("Expecting name of variable to be a symbol, but got %s",
+                var_name->is_list ? "List" : type_to_string(type(var_name)));
+    }
+    Symbol *redefined = get_symbol(value(var_name)->symbol.name);
+    if (redefined) {
+        // TODO: print kind as string
+        return make_error("Redefinition of symbol `%s`, first defined as a %d", value(var_name)->symbol.name,
+                redefined->kind);
+    }
+
+    Expression *var_value = list_at(args, 1);
+    Result value_result = eval(var_value);
+    if (value_result.error) return value_result;
+    var_value = value_result.expr;
+
+    Variable *var = create_var(value(var_name)->symbol.name, var_value);
+    da_push(&variables, var);
+
+    if (DEBUG) {
+        printf("[DEBUG] Defining variable `%s`: ", var->name);
+        print_expression(var->value);
+        printf("\n");
+    }
+
+    return make_result(create_nil());
+}
+
+Variable *get_variable(const char *name)
+{
+    for (size_t i = 0; i < variables.count; i++) {
+        if (strcmp(name, variables.items[i]->name) == 0) return variables.items[i];
+    }
+    return NULL;
+}
+
 SpecialForm special_forms[] = {
     {.name="if",    .fn=special_form_if},
+    {.name="let",   .fn=special_form_let},
     {.name="defun", .fn=special_form_defun},
 };
 const size_t special_forms_count = sizeof(special_forms)/sizeof(special_forms[0]);
@@ -505,7 +650,7 @@ SpecialForm *get_special_form(const char *name)
     { \
         assert(args && "NULL expression passed to builtin function "#function_name); \
         assert(args->is_list && "Expression passed to builtin function "#function_name" is not a list"); \
-        const char *fn_name = value(this(args))->symbol; (void)fn_name; \
+        const char *fn_name = value(this(args))->symbol.name; (void)fn_name; \
         args = next(args); \
         size_t args_count = list_len(args); (void)args_count; \
 
@@ -593,11 +738,11 @@ Expression *clone_expression(Expression *e)
         Value *v = value(e);
         c->atom.type = type(e);
         switch (type(e)) {
-        case TYPE_NIL:                                             break;
-        case TYPE_SYMBOL:  value(c)->symbol  = strdup(v->symbol);  break;
-        case TYPE_INTEGER: value(c)->integer = v->integer;         break;
-        case TYPE_BOOLEAN: value(c)->boolean = v->boolean;         break;
-        case TYPE_STRING:  value(c)->string  = strdup(v->string);  break;
+        case TYPE_NIL:                                                                                       break;
+        case TYPE_SYMBOL:  value(c)->symbol  = (Symbol){.kind=v->symbol.kind, .name=strdup(v->symbol.name)}; break;
+        case TYPE_INTEGER: value(c)->integer = v->integer;                                                   break;
+        case TYPE_BOOLEAN: value(c)->boolean = v->boolean;                                                   break;
+        case TYPE_STRING:  value(c)->string  = strdup(v->string);                                            break;
         case __types_count:
         default:
             printf("Unreachable type %d in clone_expression\n", type(e));
@@ -620,7 +765,7 @@ void free_expression(Expression *e)
         case TYPE_INTEGER:
         case TYPE_BOOLEAN:
             break;
-        case TYPE_SYMBOL:  free(v->symbol);  break;
+        case TYPE_SYMBOL:  free((char *)v->symbol.name); break;
         case TYPE_STRING:  free(v->string);  break;
         case __types_count:
         default:
@@ -639,7 +784,7 @@ void replace_args_in_body(Expression **body, CStrings params, Expression *args)
         }
     } else if (type(*body) == TYPE_SYMBOL) {
         for (size_t i = 0; i < params.count; i++) {
-            if (strcmp(value(*body)->symbol, params.items[i]) == 0) {
+            if (strcmp(value(*body)->symbol.name, params.items[i]) == 0) {
                 free_expression(*body);
                 *body = list_at(args, i);
                 return;
@@ -661,9 +806,83 @@ Result evaluate_user_function(UserFunction *uf, Expression *args)
     return eval(body);
 }
 
+void print_symbol(Symbol sym)
+{
+    switch (sym.kind) {
+    case SYM_SPECIAL_FORM: {
+        printf("Special form `%s`\n", sym.name);
+        printf("TODO: description\n");
+    } break; 
+    case SYM_BUILTIN_FUNCTION: {
+        printf("Builtin function `%s`\n", sym.name);
+        printf("TODO: description\n");
+    } break;
+    case SYM_USER_FUNCTION: {
+        printf("Builtin function `%s`\n", sym.name);
+        printf("Arguments: (");
+        for (size_t i = 0; i < sym.uf->params.count; i++) {
+            printf("%s", sym.uf->params.items[i]);
+            if (i != sym.uf->params.count-1) printf(" ");
+        }
+        printf(")\n");
+        printf("Body: ");
+        print_expression(sym.uf->body);
+        printf("\n");
+    } break;
+    case SYM_VARIABLE: {
+        printf("Variable `%s`: ", sym.name);
+        print_expression(sym.var->value);
+        printf("\n");
+    } break;
+
+    case SYM_UNKNOWN:
+    case __symbol_kinds_cout:
+    default:
+        printf("Unreachable symbol kind '%d' in print_symbol\n", sym.kind);
+        abort();
+    }
+}
+
+void resolve_symbol(Symbol *sym)
+{
+    if (sym->kind != SYM_NULL) return;
+
+    SpecialForm *sf = get_special_form(sym->name);
+    if (sf) {
+        sym->kind = SYM_SPECIAL_FORM;
+        sym->sf = sf;
+        return;
+    }
+
+    BuiltinFunction *bf = get_builtin_function(sym->name);
+    if (bf) {
+        sym->kind = SYM_BUILTIN_FUNCTION;
+        sym->bf = bf;
+        return;
+    }
+
+    UserFunction *uf = get_user_function(sym->name);
+    if (uf) {
+        sym->kind = SYM_USER_FUNCTION;
+        sym->uf = uf;
+        return;
+    }
+
+    Variable *var = get_variable(sym->name);
+    if (var) {
+        sym->kind = SYM_VARIABLE;
+        sym->var = var;
+        return;
+    }
+
+    sym->kind = SYM_UNKNOWN;
+}
+
 Result eval(Expression *e)
 {
     assert(e);
+
+    if (e->is_quoted) return make_result(e);
 
     if (DEBUG) {
         printf("[DEBUG] Evaluating expression ");
@@ -671,46 +890,54 @@ Result eval(Expression *e)
         printf("\n");
     }
 
-    Result result = {0};
-
     if (e->is_list) {
         if (list_is_empty(e)) {
-            result.expr = e;
+            return make_result(e);
         } else {
-            Expression *efn = this(e);
-            if (efn->is_list || type(efn) != TYPE_SYMBOL) {
-                printf("\nERROR: Cannot evaluate non function expression\n");
+            Expression *e_sym = this(e);
+            if (e_sym->is_list || type(e_sym) != TYPE_SYMBOL) {
+                printf("\nERROR: Cannot evaluate non symbol expression\n");
                 printf("NOTE: Offending expression: ");
-                print_expression(efn);
+                print_expression(e_sym);
                 printf("\n");
                 printf("\nTODO: return Result rather than exiting the program\n");
                 exit(1);
             }
-            const char *function_name = value(efn)->symbol;
-            SpecialForm *sf = get_special_form(function_name);
-            if (sf) {
-                result = evaluate_special_form(sf, e);
-            } else {
-                BuiltinFunction *bf = get_builtin_function(function_name);
-                if (bf) {
-                    result = evaluate_builtin_function(bf, e);
-                } else {
-                    UserFunction *uf = get_user_function(function_name);
-                    if (!uf) {
-                        return make_error("Unknown function `%s`", function_name);
-                    }
-                    result = evaluate_user_function(uf, e);
-                }
+            Symbol *sym = &value(e_sym)->symbol;
+            resolve_symbol(sym);
+            if (sym->kind == SYM_UNKNOWN) {
+                return make_error("Unknown symbol `%s`", sym->name);
+            }
+            switch (sym->kind) {
+            case SYM_SPECIAL_FORM:     return evaluate_special_form(sym->sf, e);
+            case SYM_BUILTIN_FUNCTION: return evaluate_builtin_function(sym->bf, e);
+            case SYM_USER_FUNCTION:    return evaluate_user_function(sym->uf, e);
+            case SYM_VARIABLE:         return make_result(sym->var->value); // TODO: I'm not sure, here I should evaluate the variable and checking what it contains (function)
+
+            case SYM_NULL:
+            case SYM_UNKNOWN:
+            case __symbol_kinds_cout:
+            default:
+                printf("Unreachable symbol kind '%d' in eval\n", sym->kind);
+                abort();
             }
         }
     } else {
-        result.expr = e;
+        if (type(e) == TYPE_SYMBOL) {
+            Symbol *sym = &value(e)->symbol;
+            resolve_symbol(sym);
+            if (sym->kind == SYM_VARIABLE) {
+                return make_result(sym->var->value);
+            } else {
+                return make_result(e);
+            }
+        } else {
+            return make_result(e);
+        }
     }
 
-    return result;
+    return make_error("Unreachable control flow in eval");
 }
-
-void addToHistory(char *input) { printf("- Adding input to history: %s\n", input); }
 
 void usage()
 {
@@ -753,12 +980,16 @@ int main(int argc, char **argv)
                     continue;
                 }
                 Expression *parsed_expr = parse_result.expr;
+
                 if (!parsed_expr->is_list && type(parsed_expr) == TYPE_SYMBOL) {
-                    // TODO: it can also be special form and user function
-                    if (!get_builtin_function(value(parsed_expr)->symbol)) {
-                        printf("Error: Unknown symbol `%s`\n", value(parsed_expr)->symbol);
+                    Symbol *sym = &value(parsed_expr)->symbol;
+                    resolve_symbol(sym);
+                    if (sym->kind == SYM_UNKNOWN) {
+                        printf("Error: Unknown symbol `%s`\n", sym->name);
                         continue;
                     }
+                    print_symbol(value(parsed_expr)->symbol);
+                    continue;
                 }
 
                 Result eval_result = eval(parsed_expr);
@@ -766,7 +997,9 @@ int main(int argc, char **argv)
                     printf("Evaluation error: %s\n", eval_result.message);
                     continue;
                 }
+
                 print_expression(eval_result.expr);
+
                 printf("\n");
             }
         }
