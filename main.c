@@ -13,7 +13,7 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
-static bool debug_enabled = true;
+static bool debug_enabled = false;
 bool in_repl = false;
 
 #define DEBUG (debug_enabled && !in_repl)
@@ -95,6 +95,14 @@ typedef enum
     __expr_kinds_count
 } ExprKind;
 
+typedef enum
+{
+    DIR_DEBUG,
+    DIR_LOAD,
+
+    __dir_types_count
+} DirectiveType;
+
 typedef struct Expression {
     ExprKind kind;
     bool is_quoted;
@@ -104,8 +112,27 @@ typedef struct Expression {
             struct Expression *this;
             struct Expression *next;
         } list;
+        struct {
+            DirectiveType type;
+        } directive;
     };
 } Expression;
+
+const char *directive_to_string(Expression *d)
+{
+    assert(d);
+    assert(d->kind == EXPR_DIRECTIVE);
+    switch (d->directive.type) {
+    case DIR_DEBUG: return "debug";
+    case DIR_LOAD:  return "load";
+
+    case __dir_types_count:
+    default:
+        printf("Unreachable directive type %d in directive_to_string\n", d->directive.type);
+        abort();
+    }
+}
+
 
 // TODO: add location for diagnostic and pass the offending expression in make_error for better and easy reporting
 typedef struct {
@@ -242,6 +269,8 @@ Result parse_atom(char *atom_str, size_t *_pos)
 {
     size_t pos = *_pos;
     Expression *atom = create_expression();
+    atom->kind = EXPR_ATOM;
+
     Nob_String_Builder sb = {0};
 
     if (isdigit(atom_str[pos])) { // TYPE_INTEGER
@@ -261,10 +290,11 @@ Result parse_atom(char *atom_str, size_t *_pos)
             sb_append(&sb, atom_str[pos]);
             pos++;
         }
+        sb_append_null(&sb);
         pos++;
         atom->atom.type = TYPE_STRING;
         value(atom)->string = sb.items;
-    } else { // TYPE_SYMBOL, TYPE_BOOLEAN
+    } else { // TYPE_NIL, TYPE_SYMBOL, TYPE_BOOLEAN
         while (!isspace(atom_str[pos]) && atom_str[pos] != '(' && atom_str[pos] != ')') {
             sb_append(&sb, atom_str[pos]);
             pos++;
@@ -298,6 +328,29 @@ Result parse_atom(char *atom_str, size_t *_pos)
 
 Result parse_list(char *list_str, size_t *_pos);
 
+Result parse_directive(char *directive_str, size_t *_pos)
+{
+    size_t pos = *_pos;
+    directive_str++;
+    pos++;
+
+    Expression *d = create_expression();
+    d->kind = EXPR_DIRECTIVE;
+
+    if (strncmp(directive_str, "load", 4) == 0) {
+        d->directive.type = DIR_LOAD;
+        pos += 4;
+    } else if (strncmp(directive_str, "debug", 5) == 0) {
+        d->directive.type = DIR_DEBUG;
+        pos += 5;
+    } else {
+        return make_error("Unknown directive `%s`", directive_str);
+    }
+
+    *_pos = pos;
+    return make_result(d);
+}
+
 Result parse_expression(char *expr_str, size_t *_pos)
 {
     size_t pos = *_pos;
@@ -305,6 +358,8 @@ Result parse_expression(char *expr_str, size_t *_pos)
 
     if (expr_str[pos] == '(') {
         result = parse_list(expr_str, &pos);
+    } else if (expr_str[pos] == '!') {
+        result = parse_directive(expr_str, &pos);
     } else {
         result = parse_atom(expr_str, &pos);
     }
@@ -382,12 +437,6 @@ void print_expression(Expression *e)
     }
 }
 
-Result parse_directive(char *directive_str)
-{
-    (void)directive_str;
-    return make_error("TODO: parse_directive");
-}
-
 Result parse_program(char *program_str)
 {
     Expression *program = create_list();
@@ -406,7 +455,9 @@ Result parse_program(char *program_str)
             if (r.error) return r;
             add_to_list(program, r.expr);
         } else if (program_str[pos] == '!') {
-            return make_error("TODO: directives are not yet implemented");
+            Result r = parse_directive(program_str, &pos);
+            if (r.error) return r;
+            add_to_list(program, r.expr);
         } else {
             return make_error("ERROR: Top level expression is not a list nor a directive, it starts with '%c'", program_str[pos]);
         }
@@ -734,6 +785,34 @@ UserFunction *get_user_function(const Scope *scope, const char *name)
     return NULL;
 }
 
+Result builtin_exit(Scope *scope, Expression *args)
+{
+    (void)scope;
+    assert(args && "NULL expression passed to builtin function `exit`");
+    assert(args->kind == EXPR_LIST && "Expression passed to builtin function `exit` is not a list");
+    args = next(args);
+    size_t args_count = list_len(args);
+
+    if (args_count > 1) {
+        return make_error("Number of arguments mismatch, wanted none or 1 but got %zu", args_count);
+    }
+
+    int exit_code = 0;
+
+    if (args_count == 1) {
+        Result eval_exit_code = eval(scope, list_at(args, 0));
+        if (eval_exit_code.error) return eval_exit_code;
+        Expression *expr_exit_code = eval_exit_code.expr;
+        if (expr_exit_code->kind != EXPR_ATOM && type(expr_exit_code) != TYPE_INTEGER) {
+            return make_error("Expecting exit status to be an Integer, but got %s",
+                    expr_kind_to_string(expr_exit_code));
+        }
+        exit_code = value(expr_exit_code)->integer;
+    }
+
+    exit(exit_code);
+}
+
 Result builtin_print(Scope *scope, Expression *args)
 {
     (void)scope;
@@ -787,6 +866,7 @@ Result builtin_math_plus_and_mult(Scope *scope, Expression *args)
 }
 
 BuiltinFunction builtin_functions[] = {
+    {.name="exit",  .fn=builtin_exit},
     {.name="print", .fn=builtin_print},
     {.name="+",     .fn=builtin_math_plus_and_mult},
     {.name="*",     .fn=builtin_math_plus_and_mult},
@@ -1024,6 +1104,23 @@ void resolve_symbol(const Scope *scope, Symbol *sym)
     sym->kind = SYM_UNKNOWN;
 }
 
+Result evaluate_directive(Scope *scope, Expression *d)
+{
+    (void)scope;
+
+    switch (d->directive.type) {
+    case DIR_DEBUG: debug_enabled = !debug_enabled; break;
+    case DIR_LOAD:  return make_error("TODO: directive load is not yet implemented");
+
+    case __dir_types_count:
+    default:
+        printf("Unreachable directive type %d in evaluate_directive\n", d->directive.type);
+        abort();
+    }
+
+    return make_result(create_nil());
+}
+
 Result eval(Scope *scope, Expression *e)
 {
     assert(e);
@@ -1084,7 +1181,7 @@ Result eval(Scope *scope, Expression *e)
         }
     } break;
 
-    case EXPR_DIRECTIVE: return make_error("TODO: eval directive\n");
+    case EXPR_DIRECTIVE: return evaluate_directive(scope, e);
 
     case EXPR_NULL:
     case __expr_kinds_count:
@@ -1127,44 +1224,34 @@ int main(int argc, char **argv)
             input[strlen(input)-1] = '\0';
             if (strlen(input) == 0) continue;
 
-            if (input[0] == '!') {
-                input++;
-                if (strcmp(input, "quit") == 0 || strcmp(input, "q") == 0) break;
-                else if (strcmp(input, "load") == 0 || strcmp(input, "l") == 0) {
-                    printf("TODO: load command is not yet implemented\n");
-                } else {
-                    printf("ERROR: Unknown command `%s`\n", input);
-                }
-            } else {
-                size_t pos = 0;
-                Result parse_result = parse_expression(input, &pos);
-                if (parse_result.error) {
-                    printf("Parse error: %s\n", parse_result.message);
-                    continue;
-                }
-                Expression *parsed_expr = parse_result.expr;
-
-                if (parsed_expr->kind == EXPR_ATOM && type(parsed_expr) == TYPE_SYMBOL) {
-                    Symbol *sym = &value(parsed_expr)->symbol;
-                    resolve_symbol(&global_scope, sym);
-                    if (sym->kind == SYM_UNKNOWN) {
-                        printf("Error: Unknown symbol `%s`\n", sym->name);
-                        continue;
-                    }
-                    print_symbol(value(parsed_expr)->symbol);
-                    continue;
-                }
-
-                Result eval_result = eval(&global_scope, parsed_expr);
-                if (eval_result.error) {
-                    printf("Evaluation error: %s\n", eval_result.message);
-                    continue;
-                }
-
-                print_expression(eval_result.expr);
-
-                printf("\n");
+            size_t pos = 0;
+            Result parse_result = parse_expression(input, &pos);
+            if (parse_result.error) {
+                printf("Parse error: %s\n", parse_result.message);
+                continue;
             }
+            Expression *parsed_expr = parse_result.expr;
+
+            if (parsed_expr->kind == EXPR_ATOM && type(parsed_expr) == TYPE_SYMBOL) {
+                Symbol *sym = &value(parsed_expr)->symbol;
+                resolve_symbol(&global_scope, sym);
+                if (sym->kind == SYM_UNKNOWN) {
+                    printf("Parse error: Unknown symbol `%s`\n", sym->name);
+                    continue;
+                }
+                print_symbol(value(parsed_expr)->symbol);
+                continue;
+            }
+
+            Result eval_result = eval(&global_scope, parsed_expr);
+            if (eval_result.error) {
+                printf("Evaluation error: %s\n", eval_result.message);
+                continue;
+            }
+
+            print_expression(eval_result.expr);
+
+            printf("\n");
         }
     } else if (argc == 1) { // INTERPRETER MODE
         const char *filepath = argv[0];
