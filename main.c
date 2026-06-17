@@ -85,8 +85,18 @@ typedef struct {
     Value value;
 } Atom;
 
+typedef enum
+{
+    EXPR_NULL = -1,
+    EXPR_ATOM = 0,
+    EXPR_LIST,
+    EXPR_DIRECTIVE,
+
+    __expr_kinds_count
+} ExprKind;
+
 typedef struct Expression {
-    bool is_list;
+    ExprKind kind;
     bool is_quoted;
     union {
         Atom atom;
@@ -97,6 +107,7 @@ typedef struct Expression {
     };
 } Expression;
 
+// TODO: add location for diagnostic and pass the offending expression in make_error for better and easy reporting
 typedef struct {
     Expression *expr;
     bool error;
@@ -120,35 +131,35 @@ static inline Result make_error(char *fmt, ...)
 static inline Value *value(Expression *e)
 {
     assert(e);
-    assert(!e->is_list);
+    assert(e->kind == EXPR_ATOM);
     return &e->atom.value;
 }
 
 static inline Type type(Expression *e)
 {
     assert(e);
-    assert(!e->is_list);
+    assert(e->kind == EXPR_ATOM);
     return e->atom.type;
 }
 
 static inline Expression *this(Expression *e)
 {
     assert(e);
-    assert(e->is_list);
+    assert(e->kind == EXPR_LIST);
     return e->list.this;
 }
 
 static inline Expression *next(Expression *e)
 {
     assert(e);
-    assert(e->is_list);
+    assert(e->kind == EXPR_LIST);
     return e->list.next;
 }
 
 static inline size_t list_len(Expression *list)
 {
     if (!list) return 0;
-    assert(list->is_list);
+    assert(list->kind == EXPR_LIST);
     size_t len = 0;
     while (list && this(list)) {
         len++;
@@ -187,12 +198,15 @@ static inline Expression *list_at(Expression *list, int at)
 Expression *create_expression(void)
 {
     Expression *e = calloc(1, sizeof(Expression));
+    assert(e);
+    e->kind = EXPR_NULL;
     return e;
 }
 
 Expression *create_atom(Type type)
 {
     Expression *e = create_expression();
+    e->kind = EXPR_ATOM;
     e->atom.type = type;
     return e;
 }
@@ -202,7 +216,7 @@ static inline Expression *create_nil() { return create_atom(TYPE_NIL); }
 Expression *create_list()
 {
     Expression *e = calloc(1, sizeof(Expression));
-    e->is_list = true;
+    e->kind = EXPR_LIST;
     return e;
 }
 
@@ -211,7 +225,7 @@ static inline void set_this(Expression *e, Expression *item) { e->list.this = it
 void add_to_list(Expression *list, Expression *item)
 {
     assert(list);
-    assert(list->is_list);
+    assert(list->kind == EXPR_LIST);
     assert(item);
 
     if (this(list)) { // Not the first element
@@ -331,27 +345,47 @@ void print_symbol(Symbol sym);
 void print_expression(Expression *e)
 {
     assert(e && "Printing NULL expression");
-    if (e->is_list) {
+    switch (e->kind) {
+    case EXPR_ATOM: {
+        Type t = type(e);
+        Value *v = value(e);
+        switch (t) {
+        case TYPE_NIL:     printf("nil");                               break;
+        case TYPE_SYMBOL:  printf(v->symbol.name);                      break;
+        case TYPE_INTEGER: printf("%d", v->integer);                    break;
+        case TYPE_BOOLEAN: printf("%s", v->boolean ? "true" : "false"); break;
+        case TYPE_STRING:  printf("\"%s\"", v->string);                 break;
+
+        case __types_count:
+        default:
+            printf("Unreachable atom type %d in print_expression\n", t);
+            abort();
+        }
+    } break;
+    case EXPR_LIST: {
         printf("(");
         for_list(e) {
             print_expression(this(it));
             if (next(it)) printf(" ");
         }
         printf(")");
-    } else {
-        switch (type(e)) {
-        case TYPE_NIL:     printf("nil");                                      break;
-        case TYPE_SYMBOL:  printf(value(e)->symbol.name);                      break;
-        case TYPE_INTEGER: printf("%d", value(e)->integer);                    break;
-        case TYPE_BOOLEAN: printf("%s", value(e)->boolean ? "true" : "false"); break;
-        case TYPE_STRING:  printf("\"%s\"", value(e)->string);                 break;
+    } break;
+    case EXPR_DIRECTIVE: {
+        printf("TODO: print directive\n");
+    } break;
 
-        case __types_count:
-        default:
-            printf("Unreachable atom type %d in print_expression\n", type(e));
-            abort();
-        }
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in print_expression\n", e->kind);
+        abort();
     }
+}
+
+Result parse_directive(char *directive_str)
+{
+    (void)directive_str;
+    return make_error("TODO: parse_directive");
 }
 
 Result parse_program(char *program_str)
@@ -367,63 +401,90 @@ Result parse_program(char *program_str)
 
         if (program_str[pos] == '\0') break;
 
-        if (program_str[pos] != '(') {
-            return make_error("ERROR: Top level expression is not a list, it starts with '%c'", program_str[pos]);
+        if (program_str[pos] == '(') {
+            Result r = parse_list(program_str, &pos);
+            if (r.error) return r;
+            add_to_list(program, r.expr);
+        } else if (program_str[pos] == '!') {
+            return make_error("TODO: directives are not yet implemented");
+        } else {
+            return make_error("ERROR: Top level expression is not a list nor a directive, it starts with '%c'", program_str[pos]);
         }
-
-        Result r = parse_list(program_str, &pos);
-        if (r.error) return r;
-        add_to_list(program, r.expr);
     }
 
     return make_result(program);
 }
 
-typedef Result (*Fn)(Expression *args);
+typedef struct Variable Variable;
+typedef struct UserFunction UserFunction;
+
+typedef struct {
+    struct {
+        Variable **items; 
+        size_t count;
+        size_t capacity;
+    } variables;
+    struct {
+        UserFunction *items;
+        size_t count;
+        size_t capacity;
+    } user_functions;
+} Scope;
+
+typedef Result (*Fn)(Scope *scope, Expression *args);
 
 struct BuiltinFunction {
     const char *name;
     Fn fn;
 };
 
-#define DefineSpecialForm(form_name) \
-    Result special_form_ ##form_name(Expression *args) \
-    { \
-        assert(args && "NULL expression passed to special form "#form_name); \
-        assert(args->is_list && "Expression passed to special form "#form_name" is not a list"); \
-        const char *name = value(this(args))->symbol.name; (void)name; \
-        args = next(args); \
-        size_t args_count = list_len(args); (void)args_count; \
-
 bool to_boolean(Expression *e)
 {
     assert(e);
-    if (e->is_list) {
-        return list_len(e) > 0;
-    } else {
-        switch (type(e)) {
-        case TYPE_NIL:      return false;
-        case TYPE_SYMBOL:   return true;
-        case TYPE_INTEGER:  return value(e)->integer > 0;
-        case TYPE_BOOLEAN:  return value(e)->boolean;
-        case TYPE_STRING:   return strlen(value(e)->string) > 0;
+
+    switch (e->kind) {
+    case EXPR_ATOM: {
+        Type t = type(e);
+        Value *v = value(e);
+        switch (t) {
+        case TYPE_NIL:     return false;
+        case TYPE_SYMBOL:  return true;
+        case TYPE_INTEGER: return v->integer > 0;
+        case TYPE_BOOLEAN: return v->boolean;
+        case TYPE_STRING:  return strlen(v->string) > 0;
 
         case __types_count:
         default:
             printf("Unreachable atom type %d in to_boolean\n", type(e));
             abort();
         }
+    } break;
+    case EXPR_LIST: return list_len(e) > 0;
+    case EXPR_DIRECTIVE: return false;
+
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in to_boolean\n", e->kind);
+        abort();
     }
 }
 
-Result eval(Expression *e);
+Result eval(Scope *scope, Expression *e);
 
-DefineSpecialForm(if)
+Result special_form_if(Scope *scope, Expression *args)
+{
+    (void)scope;
+    assert(args && "NULL expression passed to special form `if`");
+    assert(args->kind == EXPR_LIST && "Expression passed to special form `if` is not a list");
+    args = next(args);
+    size_t args_count = list_len(args);
+
     if (args_count != 3) {
         return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
     }
     Expression *condition = list_at(args, 0);
-    Result eval_result = eval(condition);
+    Result eval_result = eval(scope, condition);
     if (eval_result.error) return eval_result;
     Expression *evaluated_condition = eval_result.expr;
 
@@ -437,7 +498,7 @@ DefineSpecialForm(if)
 
     Expression *tt = list_at(args, 1);
     Expression *ff = list_at(args, 2);
-    return eval(to_boolean(evaluated_condition) ? tt : ff);
+    return eval(scope, to_boolean(evaluated_condition) ? tt : ff);
 }
 
 typedef struct
@@ -453,71 +514,52 @@ struct UserFunction {
     Expression *body;
 };
 
-struct
+char *expr_kind_to_string(Expression *e)
 {
-    UserFunction *items;
-    size_t count;
-    size_t capacity;
-} user_functions = {0};
+    switch (e->kind) {
+    case EXPR_ATOM: {
+        Type t = type(e);
+        switch (t) {
+        case TYPE_NIL:     return "Atom Nil";
+        case TYPE_INTEGER: return "Atom Integer";
+        case TYPE_BOOLEAN: return "Atom Boolean";
+        case TYPE_SYMBOL:  return "Atom Symbol";
+        case TYPE_STRING:  return "Atom String";
 
-UserFunction *get_user_function(const char *name)
-{
-    for (size_t i = 0; i < user_functions.count; i++) {
-        if (strcmp(user_functions.items[i].name, name) == 0) return &user_functions.items[i];
+        case __types_count:
+        default:
+            printf("Unreachable type %d in expr_kind_to_string\n", t);
+            abort();
+        }
+    } break;
+    case EXPR_LIST: return "List";
+    case EXPR_DIRECTIVE: return "Directive";
+
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in expr_kind_to_string\n", e->kind);
+        abort();
     }
-    return NULL;
 }
 
-SpecialForm *get_special_form(const char *name);
-BuiltinFunction *get_builtin_function(const char *name);
-Variable *get_variable(const char *name);
-Symbol *get_symbol(const char *name)
+Symbol *get_symbol(const Scope *scope, const char *name);
+Result special_form_defun(Scope *scope, Expression *args)
 {
-    Symbol *found = calloc(1, sizeof(Symbol));
-    assert(found);
+    assert(args && "NULL expression passed to special form `defun`");
+    assert(args->kind == EXPR_LIST && "Expression passed to special form `defun` is not a list");
+    args = next(args);
+    size_t args_count = list_len(args);
 
-    SpecialForm *sf = get_special_form(name);
-    if (sf) {
-        found->kind = SYM_SPECIAL_FORM;
-        found->sf = sf;
-        return found;
-    }
-
-    BuiltinFunction *bf = get_builtin_function(name);
-    if (bf) {
-        found->kind = SYM_BUILTIN_FUNCTION;
-        found->bf = bf;
-        return found;
-    }
-
-    UserFunction *uf = get_user_function(name);
-    if (uf) {
-        found->kind = SYM_USER_FUNCTION;
-        found->uf = uf;
-        return found;
-    }
-
-    Variable *var = get_variable(name);
-    if (var) {
-        found->kind = SYM_VARIABLE;
-        found->var = var;
-        return found;
-    }
-
-    return NULL;
-}
-
-DefineSpecialForm(defun)
     if (args_count != 3) {
         return make_error("Number of arguments mismatch, wanted 3 but got %zu", args_count);
     }
 
     Expression *def_name = list_at(args, 0); // TODO: it can be evaluated, could be powerful
-    if (def_name->is_list || type(def_name) != TYPE_SYMBOL) {
-        return make_error("Expecting name of function to be a symbol, but got %s",
-                def_name->is_list ? "List" : type_to_string(type(def_name)));
+    if (def_name->kind != EXPR_ATOM || type(def_name) != TYPE_SYMBOL) {
+        return make_error("Expecting name of function to be a symbol, but got %s", expr_kind_to_string(def_name));
     }
-    Symbol *redefined = get_symbol(value(def_name)->symbol.name);
+    Symbol *redefined = get_symbol(scope, value(def_name)->symbol.name);
     if (redefined) {
         // TODO: print kind as string
         return make_error("Redefinition of symbol `%s`, first defined as a %d", value(def_name)->symbol.name,
@@ -525,21 +567,21 @@ DefineSpecialForm(defun)
     }
 
     Expression *def_params_list = list_at(args, 1);
-    if (!def_params_list->is_list) {
+    if (def_params_list->kind != EXPR_LIST) {
         return make_error("Expecting parameters list to be a list, but got %s", type_to_string(type(def_params_list)));
     }
     CStrings params = {0};
     for_list(def_params_list) {
         Expression *param = this(it);
-        if (param->is_list || type(param) != TYPE_SYMBOL) {
+        if (param->kind != EXPR_ATOM || type(param) != TYPE_SYMBOL) {
             return make_error("Expecting parameter %zu to be a symbol, but got %s", params.count+1,
-                    param->is_list ? "List" : type_to_string(type(param)));
+                    expr_kind_to_string(param));
         }
         da_push(&params, strdup(value(param)->symbol.name));
     }
 
     Expression *def_body = list_at(args, 2);
-    if (!def_body->is_list) {
+    if (def_body->kind != EXPR_LIST) {
         return make_error("Expecting body of function to be a list, but got %s", type_to_string(type(def_body)));
     }
 
@@ -561,7 +603,7 @@ DefineSpecialForm(defun)
         .body = def_body
     };
 
-    da_push(&user_functions, uf);
+    da_push(&scope->user_functions, uf);
 
     return make_result(create_nil());
 }
@@ -570,6 +612,48 @@ struct Variable {
     const char *name;
     Expression *value;
 };
+
+SpecialForm *get_special_form(const char *name);
+BuiltinFunction *get_builtin_function(const char *name);
+UserFunction *get_user_function(const Scope *scope, const char *name);
+Variable *get_variable(const Scope *scope, const char *name);
+void resolve_symbol(const Scope *scope, Symbol *sym);
+
+Symbol *get_symbol(const Scope *scope, const char *name)
+{
+    Symbol *found = calloc(1, sizeof(Symbol));
+    assert(found);
+
+    SpecialForm *sf = get_special_form(name);
+    if (sf) {
+        found->kind = SYM_SPECIAL_FORM;
+        found->sf = sf;
+        return found;
+    }
+
+    BuiltinFunction *bf = get_builtin_function(name);
+    if (bf) {
+        found->kind = SYM_BUILTIN_FUNCTION;
+        found->bf = bf;
+        return found;
+    }
+
+    UserFunction *uf = get_user_function(scope, name);
+    if (uf) {
+        found->kind = SYM_USER_FUNCTION;
+        found->uf = uf;
+        return found;
+    }
+
+    Variable *var = get_variable(scope, name);
+    if (var) {
+        found->kind = SYM_VARIABLE;
+        found->var = var;
+        return found;
+    }
+
+    return NULL;
+}
 
 Variable *create_var(const char *name, Expression *value)
 {
@@ -580,25 +664,22 @@ Variable *create_var(const char *name, Expression *value)
     return var;
 }
 
-typedef struct
+Result special_form_let(Scope *scope, Expression *args)
 {
-    Variable **items; 
-    size_t count;
-    size_t capacity;
-} Variables;
-static Variables variables = {0};
+    assert(args && "NULL expression passed to special form `let`");
+    assert(args->kind == EXPR_LIST && "Expression passed to special form `let` is not a list");
+    args = next(args);
+    size_t args_count = list_len(args);
 
-DefineSpecialForm(let)
     if (args_count != 2) {
         return make_error("Number of arguments mismatch, wanted 2 but got %zu", args_count);
     }
 
     Expression *var_name = list_at(args, 0); // TODO: it can be evaluated, could be powerful
-    if (var_name->is_list || type(var_name) != TYPE_SYMBOL) {
-        return make_error("Expecting name of variable to be a symbol, but got %s",
-                var_name->is_list ? "List" : type_to_string(type(var_name)));
+    if (var_name->kind != EXPR_ATOM || type(var_name) != TYPE_SYMBOL) {
+        return make_error("Expecting name of variable to be a symbol, but got %s", expr_kind_to_string(var_name));
     }
-    Symbol *redefined = get_symbol(value(var_name)->symbol.name);
+    Symbol *redefined = get_symbol(scope, value(var_name)->symbol.name);
     if (redefined) {
         // TODO: print kind as string
         return make_error("Redefinition of symbol `%s`, first defined as a %d", value(var_name)->symbol.name,
@@ -606,12 +687,12 @@ DefineSpecialForm(let)
     }
 
     Expression *var_value = list_at(args, 1);
-    Result value_result = eval(var_value);
+    Result value_result = eval(scope, var_value);
     if (value_result.error) return value_result;
     var_value = value_result.expr;
 
     Variable *var = create_var(value(var_name)->symbol.name, var_value);
-    da_push(&variables, var);
+    da_push(&scope->variables, var);
 
     if (DEBUG) {
         printf("[DEBUG] Defining variable `%s`: ", var->name);
@@ -622,10 +703,10 @@ DefineSpecialForm(let)
     return make_result(create_nil());
 }
 
-Variable *get_variable(const char *name)
+Variable *get_variable(const Scope *scope, const char *name)
 {
-    for (size_t i = 0; i < variables.count; i++) {
-        if (strcmp(name, variables.items[i]->name) == 0) return variables.items[i];
+    for (size_t i = 0; i < scope->variables.count; i++) {
+        if (strcmp(name, scope->variables.items[i]->name) == 0) return scope->variables.items[i];
     }
     return NULL;
 }
@@ -645,16 +726,21 @@ SpecialForm *get_special_form(const char *name)
     return NULL;
 }
 
-#define DefineBuiltinFunction(function_name) \
-    Result builtin_ ##function_name(Expression *args) \
-    { \
-        assert(args && "NULL expression passed to builtin function "#function_name); \
-        assert(args->is_list && "Expression passed to builtin function "#function_name" is not a list"); \
-        const char *fn_name = value(this(args))->symbol.name; (void)fn_name; \
-        args = next(args); \
-        size_t args_count = list_len(args); (void)args_count; \
+UserFunction *get_user_function(const Scope *scope, const char *name)
+{
+    for (size_t i = 0; i < scope->user_functions.count; i++) {
+        if (strcmp(scope->user_functions.items[i].name, name) == 0) return &scope->user_functions.items[i];
+    }
+    return NULL;
+}
 
-DefineBuiltinFunction(print)
+Result builtin_print(Scope *scope, Expression *args)
+{
+    (void)scope;
+    assert(args && "NULL expression passed to builtin function `print`");
+    assert(args->kind == EXPR_LIST && "Expression passed to builtin function `print` is not a list");
+    args = next(args);
+
     for_list(args) {
         print_expression(this(it));
         printf("\n");
@@ -662,14 +748,22 @@ DefineBuiltinFunction(print)
     return make_result(create_nil());
 }
 
-DefineBuiltinFunction(math_plus_and_mult)
+Result builtin_math_plus_and_mult(Scope *scope, Expression *args)
+{
+    (void)scope;
+    assert(args && "NULL expression passed to builtin function `math_plus_and_mult`");
+    assert(args->kind == EXPR_LIST && "Expression passed to builtin function `math_plus_and_mult` is not a list");
+    const char *name = value(this(args))->symbol.name;
+    args = next(args);
+    size_t args_count = list_len(args);
+
     if (args_count < 2) {
         return make_error("Number of arguments mismatch, wanted at least 2 but got %zu", args_count);
     }
     int accumulator = 0;
     for_list(args) {
         Expression *arg = this(it);
-        if (arg->is_list || type(arg) != TYPE_INTEGER) {
+        if (arg->kind != EXPR_ATOM || type(arg) != TYPE_INTEGER) {
             printf("ERROR: arguments mismatch, wanted integer but got expression: ");
             print_expression(arg);
             printf("\n");
@@ -678,12 +772,12 @@ DefineBuiltinFunction(math_plus_and_mult)
         }
         if (accumulator == 0) accumulator = value(arg)->integer;
         else {
-            if (strcmp(fn_name, "+") == 0) {
+            if (strcmp(name, "+") == 0) {
                 accumulator += value(arg)->integer;
-            } else if (strcmp(fn_name, "*") == 0) {
+            } else if (strcmp(name, "*") == 0) {
                 accumulator *= value(arg)->integer;
             } else {
-                return make_error("Unknown math function `%s`", fn_name);
+                return make_error("Unknown math function `%s`", name);
             }
         }
     }
@@ -707,37 +801,36 @@ BuiltinFunction *get_builtin_function(const char *name)
     return NULL;
 }
 
-static inline Result evaluate_special_form(SpecialForm *sf, Expression *args)
+static inline Result evaluate_special_form(Scope *scope, SpecialForm *sf, Expression *args)
 {
     DEBUG_PRINT("Executing special form `%s`", sf->name);
-    return sf->fn(args);
+    return sf->fn(scope, args);
 }
 
-Result evaluate_builtin_function(BuiltinFunction *bf, Expression *args)
+Result evaluate_builtin_function(Scope *scope, BuiltinFunction *bf, Expression *args)
 {
     for_list(args) {
         if (it == args) continue;
-        Result eval_arg = eval(this(it));
+        Result eval_arg = eval(scope, this(it));
         if (eval_arg.error) return eval_arg;
         set_this(it, eval_arg.expr);
     }
 
     DEBUG_PRINT("Executing builtin function `%s`", bf->name);
-    return bf->fn(args);
+    return bf->fn(scope, args);
 }
 
 Expression *clone_expression(Expression *e)
 {
     Expression *c = create_expression();
-    if (e->is_list) {
-        c->is_list = true;
-        for_list(e) {
-            add_to_list(c, clone_expression(this(it)));
-        } 
-    } else {
+    c->kind = e->kind;
+
+    switch (e->kind) {
+    case EXPR_ATOM: {
+        Type t = type(e);
         Value *v = value(e);
-        c->atom.type = type(e);
-        switch (type(e)) {
+        c->atom.type = t;
+        switch (t) {
         case TYPE_NIL:                                                                                       break;
         case TYPE_SYMBOL:  value(c)->symbol  = (Symbol){.kind=v->symbol.kind, .name=strdup(v->symbol.name)}; break;
         case TYPE_INTEGER: value(c)->integer = v->integer;                                                   break;
@@ -745,65 +838,118 @@ Expression *clone_expression(Expression *e)
         case TYPE_STRING:  value(c)->string  = strdup(v->string);                                            break;
         case __types_count:
         default:
-            printf("Unreachable type %d in clone_expression\n", type(e));
+            printf("Unreachable type %d in clone_expression\n", t);
             abort();
         }
+    } break;
+    case EXPR_LIST: {
+        for_list(e) {
+            add_to_list(c, clone_expression(this(it)));
+        }
+    } break;
+    case EXPR_DIRECTIVE: printf("TODO: clone directive\n"); return NULL;
+
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in clone_expression\n", e->kind);
+        abort();
     }
+
     return c;
 }
 
 void free_expression(Expression *e)
 {
-    if (e->is_list) {
-        for_list(e) {
-            free_expression(this(it));
-        }
-    } else {
+    switch (e->kind) {
+    case EXPR_ATOM: {
+        Type t = type(e);
         Value *v = value(e);
-        switch (type(e)) {
+        switch (t) {
         case TYPE_NIL:
         case TYPE_INTEGER:
         case TYPE_BOOLEAN:
             break;
         case TYPE_SYMBOL:  free((char *)v->symbol.name); break;
-        case TYPE_STRING:  free(v->string);  break;
+        case TYPE_STRING:  free(v->string);              break;
         case __types_count:
         default:
-            printf("Unreachable type %d in clone\n", type(e));
+            printf("Unreachable type %d in free_expression\n", t);
             abort();
         }
+    } break;
+    case EXPR_LIST: {
+        for_list(e) {
+            free_expression(this(it));
+        }
+    } break;
+
+    case EXPR_DIRECTIVE: printf("TODO: free directive\n"); return;
+
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in free_expression\n", e->kind);
+        abort();
     }
+
     free(e);
 }
 
 void replace_args_in_body(Expression **body, CStrings params, Expression *args)
 {
-    if ((*body)->is_list) {
+    switch ((*body)->kind) {
+    case EXPR_ATOM: {
+        Type t = type(*body);
+        switch (t) {
+        case TYPE_NIL:
+        case TYPE_INTEGER:
+        case TYPE_BOOLEAN:
+        case TYPE_STRING:
+            break;
+
+        case TYPE_SYMBOL: {
+            for (size_t i = 0; i < params.count; i++) {
+                if (strcmp(value(*body)->symbol.name, params.items[i]) == 0) {
+                    free_expression(*body);
+                    *body = list_at(args, i);
+                    return;
+                }
+            }
+        } break;
+
+        case __types_count:
+        default:
+            printf("Unreachable type %d in replace_args_in_body\n", t);
+            abort();
+        }
+    } break;
+    case EXPR_LIST: {
         for_list(*body) {
             replace_args_in_body(&it->list.this, params, args);
         }
-    } else if (type(*body) == TYPE_SYMBOL) {
-        for (size_t i = 0; i < params.count; i++) {
-            if (strcmp(value(*body)->symbol.name, params.items[i]) == 0) {
-                free_expression(*body);
-                *body = list_at(args, i);
-                return;
-            }
-        }
+    } break;
+
+    case EXPR_DIRECTIVE:
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in replace_args_in_body\n", (*body)->kind);
+        abort();
     }
 }
 
-Result evaluate_user_function(UserFunction *uf, Expression *args)
+Result evaluate_user_function(Scope *scope, UserFunction *uf, Expression *args)
 {
     args = next(args);
     for_list(args) {
-        Result eval_arg = eval(this(it));
+        Result eval_arg = eval(scope, this(it));
         if (eval_arg.error) return eval_arg;
         set_this(it, eval_arg.expr);
     }
     Expression *body = clone_expression(uf->body);
     replace_args_in_body(&body, uf->params, args);
-    return eval(body);
+    return eval(scope, body);
 }
 
 void print_symbol(Symbol sym)
@@ -843,7 +989,7 @@ void print_symbol(Symbol sym)
     }
 }
 
-void resolve_symbol(Symbol *sym)
+void resolve_symbol(const Scope *scope, Symbol *sym)
 {
     if (sym->kind != SYM_NULL) return;
 
@@ -861,14 +1007,14 @@ void resolve_symbol(Symbol *sym)
         return;
     }
 
-    UserFunction *uf = get_user_function(sym->name);
+    UserFunction *uf = get_user_function(scope, sym->name);
     if (uf) {
         sym->kind = SYM_USER_FUNCTION;
         sym->uf = uf;
         return;
     }
 
-    Variable *var = get_variable(sym->name);
+    Variable *var = get_variable(scope, sym->name);
     if (var) {
         sym->kind = SYM_VARIABLE;
         sym->var = var;
@@ -878,7 +1024,7 @@ void resolve_symbol(Symbol *sym)
     sym->kind = SYM_UNKNOWN;
 }
 
-Result eval(Expression *e)
+Result eval(Scope *scope, Expression *e)
 {
     assert(e);
 
@@ -890,12 +1036,26 @@ Result eval(Expression *e)
         printf("\n");
     }
 
-    if (e->is_list) {
+    switch (e->kind) {
+    case EXPR_ATOM: {
+        if (type(e) == TYPE_SYMBOL) {
+            Symbol *sym = &value(e)->symbol;
+            resolve_symbol(scope, sym);
+            if (sym->kind == SYM_VARIABLE) {
+                return make_result(sym->var->value);
+            } else {
+                return make_result(e);
+            }
+        } else {
+            return make_result(e);
+        }
+    } break;
+    case EXPR_LIST: {
         if (list_is_empty(e)) {
             return make_result(e);
         } else {
             Expression *e_sym = this(e);
-            if (e_sym->is_list || type(e_sym) != TYPE_SYMBOL) {
+            if (e_sym->kind != EXPR_ATOM || type(e_sym) != TYPE_SYMBOL) {
                 printf("\nERROR: Cannot evaluate non symbol expression\n");
                 printf("NOTE: Offending expression: ");
                 print_expression(e_sym);
@@ -904,14 +1064,14 @@ Result eval(Expression *e)
                 exit(1);
             }
             Symbol *sym = &value(e_sym)->symbol;
-            resolve_symbol(sym);
+            resolve_symbol(scope, sym);
             if (sym->kind == SYM_UNKNOWN) {
                 return make_error("Unknown symbol `%s`", sym->name);
             }
             switch (sym->kind) {
-            case SYM_SPECIAL_FORM:     return evaluate_special_form(sym->sf, e);
-            case SYM_BUILTIN_FUNCTION: return evaluate_builtin_function(sym->bf, e);
-            case SYM_USER_FUNCTION:    return evaluate_user_function(sym->uf, e);
+            case SYM_SPECIAL_FORM:     return evaluate_special_form(scope, sym->sf, e);
+            case SYM_BUILTIN_FUNCTION: return evaluate_builtin_function(scope, sym->bf, e);
+            case SYM_USER_FUNCTION:    return evaluate_user_function(scope, sym->uf, e);
             case SYM_VARIABLE:         return make_result(sym->var->value); // TODO: I'm not sure, here I should evaluate the variable and checking what it contains (function)
 
             case SYM_NULL:
@@ -922,31 +1082,34 @@ Result eval(Expression *e)
                 abort();
             }
         }
-    } else {
-        if (type(e) == TYPE_SYMBOL) {
-            Symbol *sym = &value(e)->symbol;
-            resolve_symbol(sym);
-            if (sym->kind == SYM_VARIABLE) {
-                return make_result(sym->var->value);
-            } else {
-                return make_result(e);
-            }
-        } else {
-            return make_result(e);
-        }
+    } break;
+
+    case EXPR_DIRECTIVE: return make_error("TODO: eval directive\n");
+
+    case EXPR_NULL:
+    case __expr_kinds_count:
+    default:
+        printf("Unreachable expression kind %d in free_expression\n", e->kind);
+        abort();
     }
 
     return make_error("Unreachable control flow in eval");
 }
 
-void usage()
+void usage(const char *program_name)
 {
-    printf("Usage: ./lisp [file]\n");
+    printf("Usage: %s [file]\n", program_name);
 }
 
 int main(int argc, char **argv)
 {
-    if (argc == 1) { // REPL MODE
+    Scope global_scope = {0};
+
+    const char *program_name = argv[0];
+    argc--;
+    argv++;
+
+    if (argc == 0) { // REPL MODE
         in_repl = true;
 
         printf("\nLisp (version 0.0.1)\n");
@@ -981,9 +1144,9 @@ int main(int argc, char **argv)
                 }
                 Expression *parsed_expr = parse_result.expr;
 
-                if (!parsed_expr->is_list && type(parsed_expr) == TYPE_SYMBOL) {
+                if (parsed_expr->kind == EXPR_ATOM && type(parsed_expr) == TYPE_SYMBOL) {
                     Symbol *sym = &value(parsed_expr)->symbol;
-                    resolve_symbol(sym);
+                    resolve_symbol(&global_scope, sym);
                     if (sym->kind == SYM_UNKNOWN) {
                         printf("Error: Unknown symbol `%s`\n", sym->name);
                         continue;
@@ -992,7 +1155,7 @@ int main(int argc, char **argv)
                     continue;
                 }
 
-                Result eval_result = eval(parsed_expr);
+                Result eval_result = eval(&global_scope, parsed_expr);
                 if (eval_result.error) {
                     printf("Evaluation error: %s\n", eval_result.message);
                     continue;
@@ -1003,8 +1166,8 @@ int main(int argc, char **argv)
                 printf("\n");
             }
         }
-    } else if (argc == 2) { // INTERPRETER MODE
-        const char *filepath = argv[1];
+    } else if (argc == 1) { // INTERPRETER MODE
+        const char *filepath = argv[0];
         Nob_String_Builder sb = {0};
         if (!nob_read_entire_file(filepath, &sb)) {
             printf("\nERROR: Could not read file `%s`\n", filepath);
@@ -1026,7 +1189,7 @@ int main(int argc, char **argv)
 
         printf("Evaluating program:\n\n");
         for_list(program) {
-            Result eval_result = eval(this(it));
+            Result eval_result = eval(&global_scope, this(it));
             if (eval_result.error) {
                 printf("Evaluation error: %s\n", eval_result.message);
                 return 1;
@@ -1034,7 +1197,7 @@ int main(int argc, char **argv)
         }
 
     } else {
-        usage();
+        usage(program_name);
         return 1;
     }
 
