@@ -1,9 +1,9 @@
 // TODO:
 // - create some examples
-// - add directives: commands that start with !
-//   > !debug enables debug prints
 // - quote '
-// - list
+// - "do" builtin function: evaluate every argument, like a list of statements
+// - macros
+// - comments with ';'
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,6 +114,9 @@ typedef struct Expression {
         } list;
         struct {
             DirectiveType type;
+            union {
+                const char *load_path;
+            };
         } directive;
     };
 } Expression;
@@ -286,8 +289,18 @@ Result parse_atom(char *atom_str, size_t *_pos)
         value(atom)->integer = atoi(sb.items);
     } else if (atom_str[pos] == '"') { // TYPE_STRING
         pos++;
-        while (atom_str[pos] != '"') {
-            sb_append(&sb, atom_str[pos]);
+        char c;
+        while ((c = atom_str[pos]) != '"') {
+            if (c == '\\') {
+                pos++;
+                c = atom_str[pos];
+                switch (c) {
+                case 'n': c = '\n'; break;
+                default:
+                    return make_error("Unsupported escaped character '%c'", c);
+                }
+            }
+            sb_append(&sb, c);
             pos++;
         }
         sb_append_null(&sb);
@@ -326,21 +339,40 @@ Result parse_atom(char *atom_str, size_t *_pos)
     return make_result(atom);
 }
 
+void eat_whitespaces(char *str, size_t *pos)
+{
+    while (str[*pos] && isspace(str[*pos])) {
+        (*pos)++;
+    }
+}
+
 Result parse_list(char *list_str, size_t *_pos);
 
 Result parse_directive(char *directive_str, size_t *_pos)
 {
     size_t pos = *_pos;
-    directive_str++;
     pos++;
 
     Expression *d = create_expression();
     d->kind = EXPR_DIRECTIVE;
 
-    if (strncmp(directive_str, "load", 4) == 0) {
+    if (strncmp(directive_str+pos, "load", 4) == 0) {
+        // TODO: factor it out to a function
+        // - it can return the whole parsed list of expression in the file
         d->directive.type = DIR_LOAD;
         pos += 4;
-    } else if (strncmp(directive_str, "debug", 5) == 0) {
+        eat_whitespaces(directive_str, &pos);
+        if (directive_str[pos] == '\0') {
+            return make_error("Expecting filepath for file to load, but got EOF");
+        }
+        Nob_String_Builder sb = {0};
+        while (!isspace(directive_str[pos]) && directive_str[pos] != '(' && directive_str[pos] != ')') {
+            sb_append(&sb, directive_str[pos]);
+            pos++;
+        }
+        sb_append_null(&sb);
+        d->directive.load_path = sb.items;
+    } else if (strncmp(directive_str+pos, "debug", 5) == 0) {
         d->directive.type = DIR_DEBUG;
         pos += 5;
     } else {
@@ -406,10 +438,10 @@ void print_expression(Expression *e)
         Value *v = value(e);
         switch (t) {
         case TYPE_NIL:     printf("nil");                               break;
-        case TYPE_SYMBOL:  printf(v->symbol.name);                      break;
+        case TYPE_SYMBOL:  printf("`%s`", v->symbol.name);              break;
         case TYPE_INTEGER: printf("%d", v->integer);                    break;
         case TYPE_BOOLEAN: printf("%s", v->boolean ? "true" : "false"); break;
-        case TYPE_STRING:  printf("\"%s\"", v->string);                 break;
+        case TYPE_STRING:  printf("%s", v->string);                 break;
 
         case __types_count:
         default:
@@ -437,6 +469,20 @@ void print_expression(Expression *e)
     }
 }
 
+void skip_comment(char *str, size_t *_pos)
+{
+    size_t pos = *_pos;
+
+    pos++;
+    while (str[pos] && str[pos] != '\n')
+        pos++;
+
+    if (str[pos] == '\n')
+        pos++;
+
+    *_pos = pos;
+}
+
 Result parse_program(char *program_str)
 {
     Expression *program = create_list();
@@ -458,6 +504,8 @@ Result parse_program(char *program_str)
             Result r = parse_directive(program_str, &pos);
             if (r.error) return r;
             add_to_list(program, r.expr);
+        } else if (program_str[pos] == ';') { // TODO: support them not only at top level, I should tokenize...
+            skip_comment(program_str, &pos);
         } else {
             return make_error("ERROR: Top level expression is not a list nor a directive, it starts with '%c'", program_str[pos]);
         }
@@ -822,7 +870,6 @@ Result builtin_print(Scope *scope, Expression *args)
 
     for_list(args) {
         print_expression(this(it));
-        printf("\n");
     }
     return make_result(create_nil());
 }
@@ -1104,13 +1151,67 @@ void resolve_symbol(const Scope *scope, Symbol *sym)
     sym->kind = SYM_UNKNOWN;
 }
 
+Result merge_scopes(Scope *s1, Scope *s2)
+{
+    for (size_t i = 0; i < s2->variables.count; i++) {
+        Variable *var = s2->variables.items[i];
+        Symbol *conflict = get_symbol(s1, var->name);
+        if (conflict) {
+            free(conflict);
+            return make_error("Redefinition of variable `%s`", var->name);
+        }
+        free(conflict);
+        da_push(&s1->variables, var);
+    }
+    for (size_t i = 0; i < s2->user_functions.count; i++) {
+        UserFunction uf = s2->user_functions.items[i];
+        Symbol *conflict = get_symbol(s1, uf.name);
+        if (conflict) {
+            free(conflict);
+            return make_error("Redefinition of user function `%s`", uf.name);
+        }
+        free(conflict);
+
+        da_push(&s1->user_functions, uf);
+    }
+    return make_result(NULL);
+}
+
+Result parse_source_into_expressions(const char *filepath);
+
 Result evaluate_directive(Scope *scope, Expression *d)
 {
     (void)scope;
 
     switch (d->directive.type) {
     case DIR_DEBUG: debug_enabled = !debug_enabled; break;
-    case DIR_LOAD:  return make_error("TODO: directive load is not yet implemented");
+    case DIR_LOAD: {
+        const char *load_path = d->directive.load_path;
+        Result parse_result = parse_source_into_expressions(load_path);
+        if (parse_result.error) return parse_result;
+        Scope load_scope = {0};
+        printf("Loaded %zu expression(s) from file `%s`:\n", list_len(parse_result.expr), load_path);
+        size_t definitions_count = 0;
+        for_list(parse_result.expr) {
+            Expression *expr = this(it);
+            if (expr->kind != EXPR_LIST) continue;
+            if (list_len(expr) == 0) continue;
+            Expression *operator = list_at(expr, 0);
+            if (operator->kind != EXPR_ATOM) continue;
+            if (type(operator) != TYPE_SYMBOL) continue;
+            if (strcmp(value(operator)->symbol.name, "defun") != 0
+             && strcmp(value(operator)->symbol.name, "let") != 0)
+                continue;
+            Result eval_result = eval(&load_scope, expr);
+            if (eval_result.error) {
+                return make_error("Evaluation error: %s\n", eval_result.message);
+            }
+            definitions_count++;
+        }
+        Result merge_result = merge_scopes(scope, &load_scope);
+        if (merge_result.error) return merge_result;
+        DEBUG_PRINT("%zu definitions have been added to the scope", definitions_count);
+    } break;
 
     case __dir_types_count:
     default:
@@ -1193,6 +1294,27 @@ Result eval(Scope *scope, Expression *e)
     return make_error("Unreachable control flow in eval");
 }
 
+Result parse_source_into_expressions(const char *filepath)
+{
+    Nob_String_Builder sb = {0};
+    if (!nob_read_entire_file(filepath, &sb)) {
+        return make_error("Could not read file `%s`\n", filepath);
+    }
+    sb_append_null(&sb);
+    char *source = sb.items;
+
+    Result parse_result = parse_program(source);
+    if (parse_result.error) return parse_result;
+
+    Expression *program = parse_result.expr;
+
+    size_t expressions_count = list_len(program);
+    DEBUG_PRINT("Program `%s` has been parsed into %zu expression%s\n", filepath, expressions_count,
+            expressions_count == 1 ? "" : "s");
+
+    return make_result(program);
+}
+
 void usage(const char *program_name)
 {
     printf("Usage: %s [file]\n", program_name);
@@ -1254,25 +1376,12 @@ int main(int argc, char **argv)
             printf("\n");
         }
     } else if (argc == 1) { // INTERPRETER MODE
-        const char *filepath = argv[0];
-        Nob_String_Builder sb = {0};
-        if (!nob_read_entire_file(filepath, &sb)) {
-            printf("\nERROR: Could not read file `%s`\n", filepath);
-            return 1;
-        }
-        sb_append_null(&sb);
-        char *program_str = sb.items;
-
-        Result parse_result = parse_program(program_str);
+        Result parse_result = parse_source_into_expressions(argv[0]);
         if (parse_result.error) {
             printf("Parse error: %s\n", parse_result.message);
             return 1;
         }
         Expression *program = parse_result.expr;
-        size_t expressions_count = list_len(program);
-
-        DEBUG_PRINT("Program has been parsed into %zu expression%s\n", expressions_count,
-                expressions_count == 1 ? "" : "s");
 
         printf("Evaluating program:\n\n");
         for_list(program) {
